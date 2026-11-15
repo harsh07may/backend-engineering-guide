@@ -1,0 +1,227 @@
+<section class="cat" id="design" data-title="System Design">
+<header class="cat-head">
+  <p class="eyebrow">10 · Scale</p>
+  <h2>System Design</h2>
+  <p class="sum">System design is deciding how the pieces from the earlier chapters fit together for a particular set of requirements. There is no best architecture, only one that fits the load, the team and the failure you can least afford.</p>
+</header>
+
+<article class="topic" id="scalability" data-k="scale load capacity estimation requests per second growth back of envelope">
+<h3>Scalability</h3>
+<p class="lede">A system is scalable if it can take more load by adding resources, without being redesigned. The question is never "is it scalable?" but "what happens at ten times today's load, and what breaks first?"</p>
+<p>Start by putting numbers on <b>load</b>. Rough arithmetic is enough to tell a one-server problem from a fifty-server problem:</p>
+<div class="tbl"><table>
+<tr><th>Question</th><th>Estimate for the shop</th></tr>
+<tr><td>Orders per day</td><td class="num">1,000,000</td></tr>
+<tr><td>Average per second</td><td class="num">1,000,000 / 86,400 ≈ 12</td></tr>
+<tr><td>Peak (assume 10× average)</td><td class="num">≈ 120 writes/s</td></tr>
+<tr><td>Reads (assume 50 per order)</td><td class="num">≈ 6,000 reads/s at peak</td></tr>
+<tr><td>Storage (1 KB per order)</td><td class="num">1 GB/day ≈ 365 GB/year</td></tr>
+</table></div>
+<p>That says: writes fit one Postgres primary comfortably, reads are where the pressure is, and storage needs a plan within a couple of years. Each conclusion points at a tool you already have.</p>
+<div class="tbl"><table>
+<tr><th>Pressure</th><th>Tool</th></tr>
+<tr><td>More requests than one process handles</td><td><a href="#horizontal-scaling">Stateless instances</a> behind a <a href="#load-balancing">load balancer</a></td></tr>
+<tr><td>Read-heavy load</td><td><a href="#caching">Caching</a>, <a href="#replication">read replicas</a></td></tr>
+<tr><td>Slow work inside requests</td><td><a href="#message-queues">Queues</a> and background workers</td></tr>
+<tr><td>Writes or data beyond one database</td><td><a href="#partitioning">Partitioning</a></td></tr>
+</table></div>
+<p class="pit"><b>Common mistake</b> Designing for a thousand times the load before reaching ten times. Every scaling tool adds moving parts and failure modes. Know what you would do next, and do it when the numbers say so.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#how-to-approach-a-system-design-interview-question">System Design Primer: how to approach a design question</a></p>
+</article>
+
+<article class="topic" id="availability" data-k="uptime nines sla slo sli redundancy downtime single point of failure">
+<h3>Availability</h3>
+<p class="lede">Availability is the share of time the system answers requests successfully. It is quoted in "nines", and each extra nine cuts allowed downtime by ten.</p>
+<div class="tbl"><table>
+<tr><th>Availability</th><th>Downtime per year</th><th>Per month</th></tr>
+<tr><td class="num">99%</td><td class="num">3.65 days</td><td class="num">7.3 hours</td></tr>
+<tr><td class="num">99.9%</td><td class="num">8.8 hours</td><td class="num">44 minutes</td></tr>
+<tr><td class="num">99.99%</td><td class="num">53 minutes</td><td class="num">4.4 minutes</td></tr>
+<tr><td class="num">99.999%</td><td class="num">5.3 minutes</td><td class="num">26 seconds</td></tr>
+</table></div>
+<p>Two rules of arithmetic drive every availability design:</p>
+<ul>
+<li><b>Dependencies in a chain multiply.</b> If a request needs the API (99.9%) and the database (99.9%) and a payment service (99.9%), it succeeds 0.999³ ≈ 99.7% of the time. Every required dependency lowers the total.</li>
+<li><b>Redundant copies multiply the failure rate instead.</b> Two instances that each fail 1% of the time are both down 0.01² = 0.01% of the time, giving 99.99%, provided they fail independently.</li>
+</ul>
+<p>So you raise availability by removing <b>single points of failure</b> (anything with no spare) and by making dependencies optional, with <a href="#fault-tolerance">timeouts and fallbacks</a>.</p>
+<p>Three terms turn this into a commitment. An <b>SLI</b> (indicator) is the measurement, such as the share of requests answered without a 5xx. An <b>SLO</b> (objective) is your target for it, such as 99.9% over 30 days. An <b>SLA</b> (agreement) is a contract with customers, with penalties, set looser than the SLO.</p>
+<p class="pit"><b>Common mistake</b> Two instances on the same machine, or in the same data centre, counted as redundancy. They share a failure. Independence is the whole point: separate machines, separate zones.</p>
+<p class="more">Go deeper: <a href="https://sre.google/sre-book/service-level-objectives/">Google SRE book: service level objectives</a></p>
+</article>
+
+<article class="topic" id="reliability" data-k="correctness durability mtbf mttr backup restore rpo rto error budget data loss">
+<h3>Reliability</h3>
+<p class="lede">Reliability is whether the system does the right thing over time: correct results, no lost data, including when parts fail. A system can be available and unreliable, answering every request with stale or wrong data.</p>
+<div class="tbl"><table>
+<tr><th>Measure</th><th>Meaning</th><th>Improve it by</th></tr>
+<tr><td>MTBF</td><td>Mean time between failures</td><td>Testing, safer deploys, simpler design</td></tr>
+<tr><td>MTTR</td><td>Mean time to recover</td><td>Fast detection, rollback, automation</td></tr>
+<tr><td>RPO</td><td>How much recent data you can afford to lose</td><td>More frequent backups, synchronous <a href="#replication">replication</a></td></tr>
+<tr><td>RTO</td><td>How long a restore may take</td><td>Practised restores, standby replicas</td></tr>
+</table></div>
+<p>Shortening recovery usually pays more than preventing failure. You cannot prevent every fault, but a deploy that rolls back in one minute turns an outage into a blip.</p>
+<p>Most of the reliability toolkit is already in this guide:</p>
+<ul>
+<li><b>Correct under concurrency</b>: <a href="#transactions">transactions</a>, <a href="#atomic-operations">atomic operations</a>, constraints.</li>
+<li><b>Correct under retries</b>: <a href="#idempotency">idempotency</a>.</li>
+<li><b>Nothing silently dropped</b>: <a href="#message-queues">acknowledged queues</a>, <a href="#dead-letter-queues">dead-letter queues</a>, the <a href="#distributed-transactions">outbox</a>.</li>
+<li><b>Degrade, don't collapse</b>: <a href="#fault-tolerance">timeouts and fallbacks</a>.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> Backups that have never been restored. A backup is only proven by a restore, and the first attempt often fails: a missing permission, a corrupt file, a twelve-hour runtime. Restore to a scratch database on a schedule.</p>
+<p class="more">Go deeper: <a href="https://sre.google/sre-book/embracing-risk/">Google SRE book: embracing risk</a></p>
+</article>
+
+<article class="topic" id="monolith" data-k="monolith modular single deployable module boundaries big ball of mud">
+<h3>Monolith</h3>
+<p class="lede">A monolith is an application whose features ship as one deployable unit: one codebase, one process type, usually one database. The orders API so far is a monolith.</p>
+<div class="tbl"><table>
+<tr><th>Strengths</th><th>Limits</th></tr>
+<tr><td style="white-space:normal;font-weight:400">One thing to build, test, deploy and debug<br>Calls between features are function calls: fast, and they cannot time out<br>One database, so <a href="#transactions">transactions</a> span features</td><td>Everything scales and deploys together<br>A bug in one feature can take down all of them<br>Many teams in one codebase get in each other's way</td></tr>
+</table></div>
+<p>Those limits arrive with size, mostly team size. Until then the monolith is simply the cheapest way to run software. What makes one painful is missing structure inside it. A <b>modular monolith</b> keeps one deployable and enforces boundaries in code:</p>
+```text
+src/
+  orders/      routes.ts   service.ts   repository.ts
+  catalog/     routes.ts   service.ts   repository.ts
+  billing/     routes.ts   service.ts   repository.ts
+  app.ts
+```
+```ts title=src/orders/service.ts
+import { reserveStock } from '../catalog/service.ts';     // allowed: catalog's public functions
+
+// Not allowed: importing catalog/repository.ts or querying the products table from here.
+```
+<p>Each module owns its tables and exposes a few functions. Other modules call those and never reach into its data. If a module ever needs to become its own service, the boundary already exists.</p>
+<p class="pit"><b>Common mistake</b> Every feature querying every table. Nothing can then change without checking the whole codebase. This, more than being a monolith, is what teams are fleeing when they reach for microservices.</p>
+<p class="more">Go deeper: <a href="https://martinfowler.com/bliki/MonolithFirst.html">Martin Fowler: monolith first</a></p>
+</article>
+
+<article class="topic" id="microservices" data-k="microservices service boundaries independent deploy database per service distributed monolith grpc api gateway">
+<h3>Microservices</h3>
+<p class="lede">A microservice architecture splits the application into small services that deploy independently. Each owns its own data and talks to the others only over the network, through HTTP calls or <a href="#event-driven">events</a>.</p>
+<div class="tbl"><table>
+<tr><th></th><th>Monolith</th><th>Microservices</th></tr>
+<tr><td>Deploy</td><td>Everything together</td><td>Each service on its own schedule</td></tr>
+<tr><td>Scale</td><td>The whole app</td><td>Only the service under load</td></tr>
+<tr><td>A call between features</td><td>Function call</td><td>Network call that can be slow, fail or arrive twice</td></tr>
+<tr><td>Consistency</td><td>One <a href="#transactions">transaction</a></td><td><a href="#distributed-transactions">Sagas and outboxes</a></td></tr>
+<tr><td>Debugging</td><td>One stack trace</td><td>A request spread over many services</td></tr>
+<tr><td>Operations</td><td>One pipeline</td><td>One per service, plus the platform to run them</td></tr>
+</table></div>
+<p>What you buy is <b>independence</b>: teams ship without coordinating, a failing service need not sink the rest, and each part scales by itself. What you pay is everything in the <a href="#distributed">Distributed Systems</a> chapter, on every call between features.</p>
+```ts
+// In the monolith this was: const stock = await reserveStock(productId, quantity);
+const res = await fetch(`${config.CATALOG_URL}/v1/reservations`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'idempotency-key': orderId },
+  body: JSON.stringify({ productId, quantity }),
+  signal: AbortSignal.timeout(500),
+});
+// It now needs a timeout, a retry policy, an idempotency key, and an answer to
+// "what if catalog is down?" None of that existed as a function call.
+```
+<p>Split when a specific pain justifies it: teams blocked on each other's releases, or one component with very different scaling needs. Split along boundaries where little data is shared.</p>
+<p class="pit"><b>Common mistake</b> The distributed monolith: services that share one database or must be deployed together. That has the costs of both designs and the independence of neither. If two services cannot change separately, they are one service.</p>
+<p class="more">Go deeper: <a href="https://martinfowler.com/articles/microservices.html">Martin Fowler: microservices</a> · <a href="https://microservices.io/patterns/microservices.html">microservices.io</a></p>
+</article>
+
+<article class="topic" id="system-database-design" data-k="access patterns denormalization uuid uuidv7 primary key migration expand contract zero downtime schema change">
+<h3>Database Design</h3>
+<p class="lede"><a href="#relational-design">Relational Database Design</a> covered tables, keys and normalization. At system scale, three more decisions shape the schema: how the data is read, how rows are identified, and how the schema changes while the system runs.</p>
+<h4>Design from access patterns</h4>
+<p>List the queries first, with how often each runs. A normalized schema is the right default for writes. When a frequent read needs an expensive join or aggregate, <b>denormalize</b> on purpose: store a redundant copy shaped for that read, and update it in the same transaction as the source.</p>
+```sql
+ALTER TABLE users ADD COLUMN order_count integer NOT NULL DEFAULT 0;
+
+-- inside placeOrder's transaction, next to the insert
+UPDATE users SET order_count = order_count + 1 WHERE id = $1;
+```
+<h4>Choose identifiers deliberately</h4>
+<div class="tbl"><table>
+<tr><th>Key</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>bigint identity</td><td>Small, ordered, fast to index</td><td>Guessable, reveals volume, generated only by the database</td></tr>
+<tr><td>Random UUID (v4)</td><td>Unguessable, can be generated anywhere</td><td>Random inserts scatter across the index and slow writes</td></tr>
+<tr><td>Time-ordered UUID (v7)</td><td>Generated anywhere, and sorts by creation time so the index stays compact</td><td>16 bytes; reveals creation time</td></tr>
+</table></div>
+```sql
+CREATE TABLE payments (
+  id uuid PRIMARY KEY DEFAULT uuidv7(),     -- built into PostgreSQL 18
+  order_id bigint NOT NULL REFERENCES orders (id),
+  amount_cents integer NOT NULL
+);
+```
+<h4>Change the schema without downtime</h4>
+<p>During a deploy, old and new code run side by side, so every schema change must work with both. The pattern is <b>expand, then contract</b>. To rename `total_cents` to `amount_cents`:</p>
+<ol class="seq">
+<li><b>Expand</b><span>Add the new column. Old code ignores it.</span></li>
+<li><b>Dual write</b><span>Deploy code that writes both columns and still reads the old one.</span></li>
+<li><b>Backfill</b><span>Copy old values into the new column, in batches.</span></li>
+<li><b>Switch</b><span>Deploy code that reads and writes only the new column.</span></li>
+<li><b>Contract</b><span>Drop the old column once nothing uses it.</span></li>
+</ol>
+<p class="pit"><b>Common mistake</b> Shipping a rename or a dropped column in the same release as the code that expects it. For the minutes both versions run, one of them queries a column that does not exist.</p>
+<p class="more">Go deeper: <a href="https://martinfowler.com/bliki/ParallelChange.html">Martin Fowler: parallel change (expand and contract)</a></p>
+</article>
+
+<article class="topic" id="bottlenecks" data-k="bottleneck saturation utilization use method server-timing slowest stage amdahl capacity">
+<h3>Bottleneck Identification</h3>
+<p class="lede">A request passes through stages, and the system moves only as fast as its slowest one. That stage is the bottleneck. Improving anything else changes nothing, so the skill is finding it before fixing things.</p>
+<p>For each resource, check three things (the USE method):</p>
+<ul>
+<li><b>Utilization</b>: how busy is it? CPU at 95%.</li>
+<li><b>Saturation</b>: is work waiting for it? Requests queued for a database connection.</li>
+<li><b>Errors</b>: is it failing? Timeouts, refused connections.</li>
+</ul>
+<p>The bottleneck is the resource that is saturated while the others sit idle.</p>
+<div class="tbl"><table>
+<tr><th>Symptom</th><th>Likely bottleneck</th><th>Look at</th></tr>
+<tr><td>Database CPU high, app servers idle</td><td>Queries</td><td><a href="#query-optimization">EXPLAIN</a>, missing <a href="#indexes">indexes</a></td></tr>
+<tr><td>Requests slow, database and CPU both idle</td><td>Waiting for a pooled connection</td><td><a href="#connection-pooling">Pool size</a>, leaked clients</td></tr>
+<tr><td>One core pinned, event loop lag rising</td><td>CPU work on the <a href="#threads">main thread</a></td><td>A <a href="#profiling">CPU profile</a></td></tr>
+<tr><td>Latency follows another service's latency</td><td>A downstream dependency</td><td><a href="#fault-tolerance">Timeouts</a>, caching, async</td></tr>
+<tr><td>Memory climbing, then restarts</td><td>A <a href="#memory-leaks">memory leak</a></td><td>Heap snapshots</td></tr>
+</table></div>
+<p>To see where one request spends its time, measure the stages and report them. The `Server-Timing` header shows up in the browser's network panel:</p>
+```ts
+orders.get('/:id', async (req, res) => {
+  const t0 = performance.now();
+  const order = await loadOrder(req.params.id, res.locals.user.id);
+  const t1 = performance.now();
+  const recommendations = await getRecommendations(res.locals.user.id);
+  const t2 = performance.now();
+
+  res.set('Server-Timing', `db;dur=${(t1 - t0).toFixed(1)}, recs;dur=${(t2 - t1).toFixed(1)}`);
+  res.json({ order, recommendations });
+});
+```
+<p>Fixing one bottleneck exposes the next. Stop when the system meets its target, not when nothing is left to tune.</p>
+<p class="pit"><b>Common mistake</b> Adding app servers when the database is the bottleneck. More instances open more connections and send more queries to the part that is already struggling, and things get worse.</p>
+<p class="more">Go deeper: <a href="https://www.brendangregg.com/usemethod.html">Brendan Gregg: the USE method</a></p>
+</article>
+
+<article class="topic" id="trade-offs" data-k="tradeoff decision adr architecture decision record reversible cost complexity consistency latency">
+<h3>Trade-offs</h3>
+<p class="lede">Every design choice in this guide buys something and costs something. Good design is knowing the price and choosing it on purpose.</p>
+<div class="tbl"><table>
+<tr><th>You gain</th><th>You pay</th><th>Seen in</th></tr>
+<tr><td>Faster reads</td><td>Slower writes, more storage</td><td><a href="#indexes">Indexes</a>, denormalization</td></tr>
+<tr><td>Speed</td><td>Freshness</td><td><a href="#caching">Caching</a>, <a href="#replication">replicas</a></td></tr>
+<tr><td>Availability during a partition</td><td>Consistency</td><td><a href="#dist-consistency">CAP</a></td></tr>
+<tr><td>Fast responses</td><td>Immediate results</td><td><a href="#message-queues">Queues</a></td></tr>
+<tr><td>Higher throughput</td><td>Higher latency per item</td><td>Batching</td></tr>
+<tr><td>Team independence</td><td>Operational complexity</td><td><a href="#microservices">Microservices</a></td></tr>
+<tr><td>Durability</td><td>Write speed</td><td><a href="#replication">Synchronous replication</a></td></tr>
+<tr><td>Redundancy</td><td>Money</td><td><a href="#availability">Availability</a></td></tr>
+</table></div>
+<p>A way to make the choice instead of drifting into it:</p>
+<ol>
+<li><b>Write the requirement as a number.</b> "Fast" cannot be traded against anything. "95% of reads under 200 ms at 500 requests per second" can.</li>
+<li><b>Name what you are giving up</b>, and confirm the product can live with it. A product page may be a minute stale. A balance may not.</li>
+<li><b>Prefer the reversible option.</b> A cache can be removed tomorrow. A database or service split takes months to undo, so it deserves more evidence.</li>
+<li><b>Record it.</b> A short note with the context, the decision and what was rejected (an architecture decision record) saves the next person from re-arguing it.</li>
+</ol>
+<p class="pit"><b>Common mistake</b> Copying the architecture of a company a thousand times your size. Their design answers constraints you do not have, and brings costs you would pay in full. Start from your own numbers.</p>
+<p class="more">Go deeper: <a href="https://adr.github.io/">Architecture decision records</a> · <a href="https://github.com/donnemartin/system-design-primer#performance-vs-scalability">System Design Primer: trade-offs</a></p>
+</article>
+</section>

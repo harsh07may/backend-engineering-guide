@@ -1,0 +1,305 @@
+<section class="cat" id="deployment" data-title="Deployment and Infrastructure">
+<header class="cat-head">
+  <p class="eyebrow">13 · Shipping</p>
+  <h2>Deployment &amp; Infrastructure</h2>
+  <p class="sum">Code that only runs on your laptop helps nobody. This chapter follows the orders API from a Linux server to a container, through an automated pipeline, and onto infrastructure that is itself written as code.</p>
+</header>
+
+<article class="topic" id="linux" data-k="linux shell commands systemd journalctl ps ss df free permissions ssh service">
+<h3>Linux Fundamentals</h3>
+<p class="lede">Almost every backend runs on Linux, including inside containers. You need enough of it to start a service, see what it is doing, and find out why it stopped.</p>
+<p>The ideas are ones from <a href="#os">Operating Systems</a>: <a href="#processes">processes</a> and signals, <a href="#file-systems">files and permissions</a>, <a href="#ports">ports</a>. These commands let you inspect each:</p>
+<div class="tbl"><table>
+<tr><th>Question</th><th>Command</th></tr>
+<tr><td>What is running, and using what?</td><td>`ps aux`, `top`</td></tr>
+<tr><td>Which process listens on which port?</td><td>`ss -ltnp`</td></tr>
+<tr><td>Is the disk full?</td><td>`df -h`</td></tr>
+<tr><td>How much memory is free?</td><td>`free -h`</td></tr>
+<tr><td>Does the service answer locally?</td><td>`curl -i localhost:3000/health`</td></tr>
+<tr><td>What does DNS return?</td><td>`dig api.shop.com`</td></tr>
+<tr><td>What did the service log?</td><td>`journalctl -u orders-api -f`</td></tr>
+<tr><td>Who owns this file, and who may read it?</td><td>`ls -l`</td></tr>
+</table></div>
+<p>On a plain server, <b>systemd</b> is the program that starts services at boot, restarts them when they crash and collects their output. A service is described in a unit file:</p>
+```ini title=/etc/systemd/system/orders-api.service
+[Unit]
+Description=Orders API
+After=network.target
+
+[Service]
+User=orders
+WorkingDirectory=/srv/orders-api
+EnvironmentFile=/etc/orders-api.env
+ExecStart=/usr/bin/node src/server.ts
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl enable --now orders-api    # start now and at every boot
+systemctl status orders-api               # running? last exit code? recent log lines
+```
+<p>Stopping the service sends SIGTERM, which is what the <a href="#processes">shutdown handler</a> listens for.</p>
+<p class="pit"><b>Common mistake</b> Running the service as root. A bug that lets an attacker run code then gives them the whole machine. Give the service its own user with access to its own directory only, as `User=orders` does.</p>
+<p class="more">Go deeper: <a href="https://linuxjourney.com/">Linux Journey</a></p>
+</article>
+
+<article class="topic" id="docker" data-k="container image dockerfile layers compose registry build cache pid 1 dockerignore">
+<h3>Docker</h3>
+<p class="lede">"Works on my machine" happens because machines differ: Node version, system libraries, configuration. Docker packages the app with everything it needs into an <b>image</b>, and the image runs identically anywhere.</p>
+<ul>
+<li>An <b>image</b> is a read-only package: your code, its dependencies, and a minimal Linux file system.</li>
+<li>A <b>container</b> is a running instance of an image: an ordinary <a href="#processes">process</a>, isolated by the kernel so it sees only its own files, network and process list. It is not a virtual machine and starts in milliseconds.</li>
+<li>A <b>registry</b> stores images so servers can pull them.</li>
+</ul>
+```text title=Dockerfile
+FROM node:26-slim
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+COPY src ./src
+
+USER node
+EXPOSE 3000
+CMD ["node", "src/server.ts"]
+```
+<p>Each instruction creates a <b>layer</b>, and Docker reuses a layer when its inputs are unchanged. Copying `package*.json` and installing before copying the source means a code change does not reinstall dependencies. There is no build stage because Node runs the TypeScript directly.</p>
+```bash
+docker build -t orders-api:1.4.2 .
+docker run --rm -p 3000:3000 --env-file .env orders-api:1.4.2
+```
+<p>For local development, Compose starts the whole stack with one command:</p>
+```yaml title=compose.yaml
+services:
+  api:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://shop:shop@db:5432/shop     # service names are hostnames
+      REDIS_URL: redis://cache:6379
+    depends_on: [db, cache]
+  db:
+    image: postgres:18
+    environment: { POSTGRES_USER: shop, POSTGRES_PASSWORD: shop, POSTGRES_DB: shop }
+    volumes: ["pgdata:/var/lib/postgresql"]               # data outlives the container
+  cache:
+    image: redis:8
+volumes:
+  pgdata:
+```
+<p class="pit"><b>Common mistake</b> Starting the app through a shell or `npm start`. That wrapper becomes the container's main process and may not pass SIGTERM on, so every stop is a hard kill after a timeout. Use the list form of `CMD` shown above, which runs `node` directly.</p>
+<p>Two more: add a `.dockerignore` listing `node_modules`, `.env` and `.git`, and never put secrets in an image, because anyone who can pull it can read every layer.</p>
+<p class="more">Go deeper: <a href="https://docs.docker.com/build/building/best-practices/">Docker: build best practices</a></p>
+</article>
+
+<article class="topic" id="reverse-proxy" data-k="nginx caddy proxy_pass tls termination x-forwarded-for upstream gateway forward proxy">
+<h3>Reverse Proxy</h3>
+<p class="lede">A reverse proxy is a server that stands in front of your application, receives every request, and forwards it. Clients talk only to the proxy.</p>
+<div class="flow">
+<span>Client</span><i>HTTPS →</i><span class="hot">Reverse proxy<b>TLS, routing, limits</b></span><i>HTTP →</i><span>Node :3000</span>
+</div>
+<p>It takes over work that is common to every app and awkward to do in Node:</p>
+<ul>
+<li><b><a href="#tls">TLS termination</a></b>: holds the certificate and decrypts.</li>
+<li><b>Routing</b>: `/v1` to the API, `/` to a front-end, by host or path.</li>
+<li><b>Buffering</b>: absorbs slow clients so they do not tie up the app.</li>
+<li><b>Compression, static files, request size limits</b>, and <a href="#load-balancing">load balancing</a> across instances.</li>
+</ul>
+<p>A forward proxy is the mirror image: it sits in front of clients and hides them from servers. A reverse proxy sits in front of servers.</p>
+```text title=nginx: /etc/nginx/conf.d/api.conf
+upstream orders_api {
+  server 127.0.0.1:3000;
+  keepalive 32;                        # reuse connections to Node
+}
+
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name api.shop.com;
+  ssl_certificate     /etc/letsencrypt/live/api.shop.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/api.shop.com/privkey.pem;
+
+  client_max_body_size 1m;
+
+  location / {
+    proxy_pass http://orders_api;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 30s;
+  }
+}
+```
+<p>The `X-Forwarded-*` headers are how Express learns the real client address and scheme, once <a href="#ip-addresses">trust proxy</a> is set. In the cloud, a managed load balancer usually plays this role, and Caddy is a simpler alternative that obtains certificates automatically.</p>
+<p class="pit"><b>Common mistake</b> Mismatched timeouts. If the proxy gives up after 30 seconds but the app keeps working for 60, the client sees a 504 and retries while the first request is still running. Order them: the app's own limits shortest, then the proxy, then the client.</p>
+<p class="more">Go deeper: <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html">nginx: proxy module</a> · <a href="https://caddyserver.com/docs/quick-starts/reverse-proxy">Caddy: reverse proxy</a></p>
+</article>
+
+<article class="topic" id="ci-cd" data-k="continuous integration delivery deployment pipeline github actions rolling blue-green canary rollback workflow">
+<h3>CI/CD</h3>
+<p class="lede">CI/CD automates the path from a commit to running in production, so that releasing is routine instead of an event.</p>
+<ul>
+<li><b>Continuous integration</b>: every push is type-checked and tested automatically. Problems surface minutes after they are written.</li>
+<li><b>Continuous delivery</b>: every change that passes becomes a deployable artifact, here a Docker image, and can be released at any time.</li>
+<li><b>Continuous deployment</b>: every change that passes is released without a manual step.</li>
+</ul>
+<div class="flow">
+<span>Push</span><i>→</i><span>Type-check</span><i>→</i><span>Test</span><i>→</i><span>Build image</span><i>→</i><span>Deploy to staging</span><i>→</i><span><a href="#e2e-testing">Smoke test</a></span><i>→</i><span class="hot">Deploy to production</span>
+</div>
+```yaml title=.github/workflows/ci.yml
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: 26, cache: npm }
+      - run: npm ci
+      - run: npx tsc                 # type-check
+      - run: node --test             # unit and integration tests (Docker is available for Testcontainers)
+
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - run: docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+      - run: docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+```
+<p>The image is tagged with the commit hash. Every release is then traceable to exact code, and rolling back means deploying the previous tag.</p>
+<div class="tbl"><table>
+<tr><th>Rollout</th><th>How</th><th>Trade-off</th></tr>
+<tr><td>Rolling</td><td>Replace instances a few at a time</td><td>No extra capacity. Old and new run together for a while.</td></tr>
+<tr><td>Blue-green</td><td>Bring up a full new set, then switch traffic at once</td><td>Instant rollback. Double the capacity during the switch.</td></tr>
+<tr><td>Canary</td><td>Send a small share of traffic to the new version and watch</td><td>Limits the damage of a bad release. Needs good <a href="#monitoring">monitoring</a>.</td></tr>
+</table></div>
+<p>All three run two versions side by side, which is why <a href="#system-database-design">schema changes</a> must be compatible with both.</p>
+<p class="pit"><b>Common mistake</b> Deploying the `latest` tag. Nobody can say which code is running, and there is no previous version to roll back to. Deploy immutable, uniquely tagged images.</p>
+<p class="more">Go deeper: <a href="https://docs.github.com/en/actions">GitHub Actions docs</a></p>
+</article>
+
+<article class="topic" id="cloud" data-k="aws gcp azure compute storage networking vpc subnet security group iam region availability zone managed service serverless">
+<h3>Cloud Fundamentals</h3>
+<p class="lede">A cloud provider rents out computers, disks and networks by the hour, through an API. You get capacity in minutes and pay for what you use. Every provider offers the same few building blocks under different names.</p>
+<div class="tbl"><table>
+<tr><th>Building block</th><th>What it is</th><th>AWS</th><th>Google Cloud</th><th>Azure</th></tr>
+<tr><td>Virtual machine</td><td>A server you manage</td><td>EC2</td><td>Compute Engine</td><td>Virtual Machines</td></tr>
+<tr><td>Container service</td><td>Runs your image; the provider manages servers</td><td>ECS, App Runner</td><td>Cloud Run</td><td>Container Apps</td></tr>
+<tr><td>Functions</td><td>Runs code per event, scales to zero</td><td>Lambda</td><td>Cloud Run functions</td><td>Functions</td></tr>
+<tr><td><a href="#object-storage">Object storage</a></td><td>Files by key</td><td>S3</td><td>Cloud Storage</td><td>Blob Storage</td></tr>
+<tr><td>Managed database</td><td>Postgres with backups, patching and failover handled</td><td>RDS, Aurora</td><td>Cloud SQL</td><td>Database for PostgreSQL</td></tr>
+<tr><td>Managed cache</td><td>Redis as a service</td><td>ElastiCache</td><td>Memorystore</td><td>Managed Redis</td></tr>
+<tr><td>Queue</td><td><a href="#message-queues">Messages</a> as a service</td><td>SQS</td><td>Pub/Sub</td><td>Service Bus</td></tr>
+</table></div>
+<p>Three concepts tie them together:</p>
+<ul>
+<li><b>Regions and zones.</b> A region is a geographic area. Each has several <b>availability zones</b>, separate data centres. Spreading instances across zones is how you get the independent failures that <a href="#availability">availability</a> depends on.</li>
+<li><b>Private networking.</b> Your resources live in a private network (a VPC) divided into subnets. Only the load balancer sits in a public subnet. App servers and databases sit in private ones, reachable only from inside. Firewall rules (security groups) state which resource may call which, on which <a href="#ports">port</a>.</li>
+<li><b>Identity (IAM).</b> Every call to the cloud API is made by an identity with permissions. A server gets its own role, which is how the <a href="#secrets-management">secrets example</a> authenticated without a key.</li>
+</ul>
+<p>The provider secures the data centres and hardware. Configuration is yours: who can reach what, and who can read what.</p>
+<p class="pit"><b>Common mistake</b> A database reachable from the internet, with a firewall rule open to `0.0.0.0/0` on port 5432. Automated scanners find it within hours. Databases belong in a private subnet, open only to the app's security group.</p>
+<p class="more">Go deeper: <a href="https://docs.aws.amazon.com/whitepapers/latest/aws-overview/introduction.html">AWS overview</a> · <a href="https://learn.microsoft.com/en-us/azure/architecture/guide/">Azure architecture guide</a></p>
+</article>
+
+<article class="topic" id="kubernetes" data-k="k8s pod deployment service ingress configmap secret probe replicas rolling update autoscaling desired state manifest">
+<h3>Kubernetes</h3>
+<p class="lede">Running a few containers by hand is easy. Running hundreds across many machines, restarting the ones that die and rolling out new versions without downtime, is a job for an orchestrator. Kubernetes is the standard one.</p>
+<p>Its model is <b>desired state</b>. You declare what should exist ("three copies of this image, reachable on port 80"). Kubernetes compares that with reality in a continuous loop and fixes any difference: a crashed container is restarted, a dead machine's containers are rescheduled elsewhere.</p>
+<div class="tbl"><table>
+<tr><th>Object</th><th>Purpose</th></tr>
+<tr><td>Pod</td><td>The smallest unit: one or more containers that run together</td></tr>
+<tr><td>Deployment</td><td>Keeps N identical pods running and performs rolling updates</td></tr>
+<tr><td>Service</td><td>A stable name and address that load-balances across a set of pods</td></tr>
+<tr><td>Ingress</td><td>Routes outside HTTP traffic to services: the <a href="#reverse-proxy">reverse proxy</a></td></tr>
+<tr><td>ConfigMap / Secret</td><td>Configuration and credentials, injected as <a href="#env-vars">environment variables</a> or files</td></tr>
+</table></div>
+```yaml title=k8s/orders-api.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: orders-api }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: orders-api } }
+  template:
+    metadata: { labels: { app: orders-api } }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/shop/orders-api:3f9c2ab        # the tag CI pushed
+          ports: [{ containerPort: 3000 }]
+          envFrom: [{ secretRef: { name: orders-api-env } }]
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }       # reserved for scheduling
+            limits: { memory: 512Mi }                    # killed if exceeded
+          readinessProbe: { httpGet: { path: /ready, port: 3000 } }
+          livenessProbe: { httpGet: { path: /health, port: 3000 } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: orders-api }
+spec:
+  selector: { app: orders-api }
+  ports: [{ port: 80, targetPort: 3000 }]
+```
+```bash
+kubectl apply -f k8s/                  # make the cluster match these files
+kubectl get pods                       # what is running
+kubectl logs deploy/orders-api -f      # follow logs
+kubectl rollout undo deploy/orders-api # go back to the previous version
+```
+<p>Much of this guide plugs in directly. The probes are the <a href="#load-balancing">health endpoints</a>. A rolling update sends SIGTERM to old pods, which the <a href="#processes">shutdown handler</a> catches. An autoscaler can change `replicas` from CPU or request rate.</p>
+<p class="pit"><b>Common mistake</b> Adopting Kubernetes for one small service. It is a platform to operate, with its own upgrades, networking and failure modes. A managed container service runs an image with far less to learn. Kubernetes pays off with many services and a team to look after it.</p>
+<p class="more">Go deeper: <a href="https://kubernetes.io/docs/concepts/overview/">Kubernetes: overview</a></p>
+</article>
+
+<article class="topic" id="iac" data-k="infrastructure as code terraform opentofu pulumi state plan apply drift declarative provisioning">
+<h3>Infrastructure as Code</h3>
+<p class="lede">Clicking through a cloud console creates infrastructure nobody can review, reproduce or roll back. Infrastructure as code describes servers, databases and networks in files, kept in git and applied by a tool.</p>
+<p>What that gives you: a second environment is the same files with different variables, every change goes through code review, and history shows who changed what and why.</p>
+<p>Terraform is the most widely used tool. It is declarative, like Kubernetes: you describe the end state and it works out the steps.</p>
+```text title=infra/main.tf
+resource "aws_s3_bucket" "uploads" {
+  bucket = "shop-uploads-${var.environment}"
+}
+
+resource "aws_db_instance" "orders" {
+  identifier        = "orders-${var.environment}"
+  engine            = "postgres"
+  engine_version    = "18"
+  instance_class    = "db.t4g.medium"
+  allocated_storage = 50
+  multi_az          = true               # standby replica in another zone
+
+  username                    = "shop"
+  manage_master_user_password = true     # password generated and kept in Secrets Manager
+}
+```
+```bash
+terraform plan     # show exactly what would be created, changed or destroyed
+terraform apply    # make it so, after you confirm
+```
+<p>Two concepts explain how it behaves:</p>
+<ul>
+<li><b>State.</b> Terraform records what it created in a state file and compares your code against it. A team keeps the state in shared, locked storage so two people cannot apply at once.</li>
+<li><b>Drift.</b> If someone changes a resource by hand, reality no longer matches the code. The next `plan` shows the difference.</li>
+</ul>
+<p>Alternatives follow the same idea: OpenTofu is an open-source fork of Terraform, and Pulumi and AWS CDK let you write infrastructure in TypeScript.</p>
+<p class="pit"><b>Common mistake</b> Fixing something in the console "just this once". The code is now wrong, and the next apply either reverts your fix or fails. Make every change through the code. Treat the state file as sensitive too, since it can contain generated passwords.</p>
+<p class="more">Go deeper: <a href="https://developer.hashicorp.com/terraform/intro">Terraform: introduction</a></p>
+</article>
+</section>

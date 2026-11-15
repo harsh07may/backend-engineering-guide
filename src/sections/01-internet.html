@@ -1,0 +1,202 @@
+<section class="cat" id="internet" data-title="How the Internet Works">
+<header class="cat-head">
+  <p class="eyebrow">01 · Foundations</p>
+  <h2>How the Internet Works</h2>
+  <p class="sum">Before your handler runs, a request has found your machine, opened a connection and agreed on encryption. This chapter builds that path from the bottom up.</p>
+</header>
+
+<article class="topic" id="ip-addresses" data-k="ipv4 ipv6 private nat loopback cidr trust proxy req.ip 0.0.0.0">
+<h3>IP Addresses</h3>
+<p class="lede">Every device on a network needs an address so that packets (small chunks of data) can be delivered to it. That address is its IP address.</p>
+<ul>
+<li><b>IPv4</b> is 32 bits, written `203.0.113.7`. About 4.3 billion exist, which is too few. <b>IPv6</b> is 128 bits, written `2001:db8::7`.</li>
+<li><b>Private ranges</b> (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) are only reachable inside a network. A router doing NAT (network address translation) shares one public address among them. The `/8` suffix is CIDR notation: the first 8 bits are fixed.</li>
+<li><b>Loopback</b> (`127.0.0.1`, `::1`) means "this machine". `0.0.0.0` means "every interface on this machine".</li>
+</ul>
+<p>In production your app sits behind a proxy or load balancer, so the address Express sees is the proxy's. The real client address arrives in the `X-Forwarded-For` header, and Express only trusts that header if you say how many proxies are in front:</p>
+```ts
+app.set('trust proxy', 1);   // exactly one proxy in front of this app
+
+app.get('/whoami', (req, res) => {
+  res.json({ ip: req.ip });  // client address, not the proxy's
+});
+```
+<p class="pit"><b>Common mistake</b> Listening on `127.0.0.1` inside a container. Nothing outside the container can reach loopback; listen on `0.0.0.0`. The opposite mistake is `trust proxy: true` with no proxy in front, which lets any client fake its address by sending the header itself.</p>
+<p class="more">Go deeper: <a href="https://expressjs.com/en/guide/behind-proxies.html">Express behind proxies</a></p>
+</article>
+
+<article class="topic" id="ports" data-k="socket eaddrinuse well-known ephemeral listen 443 5432 6379">
+<h3>Ports</h3>
+<p class="lede">An IP address gets a packet to a machine. A port, a number from 0 to 65535, gets it to the right program on that machine.</p>
+<p>A connection is identified by four values: source IP, source port, destination IP, destination port. That is why one server port can hold thousands of connections at once: each client differs in its own address and port.</p>
+<div class="tbl"><table>
+<tr><th>Port</th><th>Used by</th></tr>
+<tr><td class="num">80 / 443</td><td>HTTP / HTTPS</td></tr>
+<tr><td class="num">5432</td><td>PostgreSQL</td></tr>
+<tr><td class="num">6379</td><td>Redis</td></tr>
+<tr><td class="num">below 1024</td><td>Reserved. Binding needs elevated privileges on most systems, which is why apps listen on 3000 or 8080 and let a proxy own 443.</td></tr>
+</table></div>
+<p>Only one process can listen on a given address and port. A second one fails with `EADDRINUSE`, which the `app.listen` callback in <a href="#project-setup">server.ts</a> reports.</p>
+<p class="pit"><b>Common mistake</b> Hard-coding the port. Platforms assign one through the `PORT` environment variable, so read it as the setup code does.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/net.html#serverlisten">Node.js server.listen</a></p>
+</article>
+
+<article class="topic" id="tcp-udp" data-k="transport handshake syn ack reliable datagram quic keep-alive keepAliveTimeout 502">
+<h3>TCP / UDP</h3>
+<p class="lede">IP delivers single packets with no promise they arrive, or arrive in order. Transport protocols sit on top and decide what to do about that.</p>
+<div class="tbl"><table>
+<tr><th></th><th>TCP</th><th>UDP</th></tr>
+<tr><td>Model</td><td>A connection: an ordered stream of bytes</td><td>Independent messages (datagrams)</td></tr>
+<tr><td>Setup</td><td>Three-way handshake, one round trip</td><td>None</td></tr>
+<tr><td>Lost packets</td><td>Detected and re-sent</td><td>Gone</td></tr>
+<tr><td>Order</td><td>Guaranteed</td><td>Not guaranteed</td></tr>
+<tr><td>Used by</td><td>HTTP/1.1, HTTP/2, Postgres, Redis</td><td>DNS, video calls, HTTP/3 (through QUIC)</td></tr>
+</table></div>
+<ol class="seq">
+<li><b>Client → Server</b><span>SYN: "I want to connect"</span></li>
+<li><b>Server → Client</b><span>SYN-ACK: "Agreed"</span></li>
+<li><b>Client → Server</b><span>ACK. Data can now flow both ways.</span></li>
+</ol>
+<p>The handshake costs a full round trip before any data moves, so connections are reused. HTTP keeps them open between requests (keep-alive), and database drivers keep a pool of them (see <a href="#sql">SQL</a>).</p>
+<p>Reuse has one sharp edge. If Node closes an idle connection just as the load balancer sends a request down it, the client gets a 502. Keep Node's idle timeout longer than the load balancer's:</p>
+```ts title=src/server.ts
+const server = app.listen(port);
+server.keepAliveTimeout = 65_000;  // load balancer idles out at 60 s
+server.headersTimeout = 66_000;    // must exceed keepAliveTimeout
+```
+<p class="pit"><b>Common mistake</b> Reading "UDP is unreliable" as "UDP is worse". It skips guarantees so the application can choose its own. QUIC, the transport under HTTP/3, rebuilds reliability on UDP without TCP's rule that one lost packet stalls everything behind it.</p>
+<p class="more">Go deeper: <a href="https://hpbn.co/building-blocks-of-tcp/">HPBN: Building Blocks of TCP</a> · <a href="https://hpbn.co/building-blocks-of-udp/">Building Blocks of UDP</a></p>
+</article>
+
+<article class="topic" id="dns" data-k="domain resolver ttl a record aaaa cname authoritative nameserver lookup">
+<h3>DNS</h3>
+<p class="lede">People use names, networks use IP addresses. DNS (Domain Name System) is the lookup between them.</p>
+<ol class="seq">
+<li><b>App → OS</b><span>Checks local caches for `api.shop.com`.</span></li>
+<li><b>OS → Resolver</b><span>On a miss, asks a recursive resolver (your ISP's, or `1.1.1.1`).</span></li>
+<li><b>Resolver → Root</b><span>"Who handles `.com`?"</span></li>
+<li><b>Resolver → TLD server</b><span>"Who handles `shop.com`?"</span></li>
+<li><b>Resolver → Authoritative</b><span>"What is `api.shop.com`?" Gets the address and a TTL.</span></li>
+</ol>
+<p>Each answer carries a <b>TTL</b> (time to live): how many seconds anyone may cache it. The record types you will meet:</p>
+<div class="tbl"><table>
+<tr><th>Record</th><th>Maps a name to</th></tr>
+<tr><td>A / AAAA</td><td>An IPv4 / IPv6 address</td></tr>
+<tr><td>CNAME</td><td>Another name (an alias)</td></tr>
+<tr><td>MX</td><td>The mail servers for the domain</td></tr>
+<tr><td>TXT</td><td>Free text, used to prove you own the domain</td></tr>
+</table></div>
+```ts
+import { resolve4 } from 'node:dns/promises';
+
+console.log(await resolve4('example.com', { ttl: true }));
+// [ { address: '…', ttl: 300 } ]
+```
+<p>Node resolves names for you whenever you connect to a host, so you rarely call this. You do need the model when a deploy "works for me" and fails for others: they still hold the old cached answer.</p>
+<p class="pit"><b>Common mistake</b> Moving a service to a new address while the record has a one-day TTL. Lower the TTL a day ahead, switch, then raise it again.</p>
+<p class="more">Go deeper: <a href="https://www.cloudflare.com/learning/dns/what-is-dns/">Cloudflare: What is DNS?</a></p>
+</article>
+
+<article class="topic" id="http" data-k="https request response headers stateless http/2 http/3 method path body">
+<h3>HTTP / HTTPS</h3>
+<p class="lede">HTTP is the conversation format of the web: the client sends one request, the server sends one response.</p>
+```http title=request
+POST /v1/orders HTTP/1.1
+Host: api.shop.com
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOi…
+
+{"productId": 7, "quantity": 2}
+```
+```http title=response
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /v1/orders/1042
+
+{"id": "1042", "status": "pending"}
+```
+<p>A request is a <b>method</b>, a <b>path</b>, <b>headers</b> (metadata) and an optional <b>body</b>. A response is a <b>status code</b>, headers and a body. Express hands you both as objects:</p>
+```ts
+app.post('/echo', (req, res) => {
+  req.method;                 // 'POST'
+  req.path;                   // '/echo'
+  req.get('content-type');    // header lookup, case-insensitive
+  req.body;                   // parsed by express.json()
+  res.status(200).set('X-Request-Id', 'abc').json(req.body);
+});
+```
+<p>HTTP is <b>stateless</b>: the server remembers nothing between requests. Anything that must persist, such as who is logged in, travels with each request or lives in a store every server can reach.</p>
+<div class="tbl"><table>
+<tr><th>Version</th><th>Runs on</th><th>Main change</th></tr>
+<tr><td>HTTP/1.1</td><td>TCP</td><td>One request at a time per connection</td></tr>
+<tr><td>HTTP/2</td><td>TCP</td><td>Many requests share one connection (multiplexing)</td></tr>
+<tr><td>HTTP/3</td><td>QUIC over UDP</td><td>A lost packet no longer stalls the other requests</td></tr>
+</table></div>
+<p><b>HTTPS</b> is the same HTTP sent through an encrypted <a href="#tls">TLS</a> connection. Typically the proxy speaks HTTP/2 or 3 to browsers and plain HTTP/1.1 to your Node process.</p>
+<p class="pit"><b>Common mistake</b> Keeping state in a variable in the Node process, such as a `Map` of logged-in users. It disappears on restart and the second server instance never sees it.</p>
+<p class="more">Go deeper: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview">MDN: Overview of HTTP</a></p>
+</article>
+
+<article class="topic" id="tls" data-k="ssl certificate encryption handshake termination hsts https req.secure">
+<h3>TLS</h3>
+<p class="lede">Plain HTTP can be read and altered by any machine on the path. TLS (Transport Layer Security) wraps the connection to give three guarantees.</p>
+<ul>
+<li><b>Encryption</b>: others cannot read the traffic.</li>
+<li><b>Integrity</b>: changes in transit are detected.</li>
+<li><b>Authentication</b>: the server proves it is `api.shop.com` with a <b>certificate</b>, a public key plus the domain name, signed by a certificate authority your system already trusts.</li>
+</ul>
+<ol class="seq">
+<li><b>Client → Server</b><span>ClientHello: supported ciphers and a key share.</span></li>
+<li><b>Server → Client</b><span>ServerHello: its key share, the certificate, and proof it holds the private key.</span></li>
+<li><b>Both</b><span>Derive the same secret key from the two shares. Everything after is encrypted with it.</span></li>
+</ol>
+<p>TLS 1.3 finishes this in one round trip. The slow public-key math happens once; the shared key then encrypts the rest cheaply.</p>
+<p>You rarely do TLS in Node. The proxy or load balancer decrypts (<b>TLS termination</b>) and forwards plain HTTP, adding `X-Forwarded-Proto: https`. With `trust proxy` set, Express reads that header:</p>
+```ts
+app.set('trust proxy', 1);
+
+app.use((req, res, next) => {
+  if (req.secure) return next();                              // arrived over HTTPS
+  res.redirect(308, `https://${req.hostname}${req.originalUrl}`);
+});
+```
+<p class="pit"><b>Common mistake</b> Silencing a certificate error with `rejectUnauthorized: false` or `NODE_TLS_REJECT_UNAUTHORIZED=0`. That switches off authentication, so you are encrypting traffic to whoever answers. Fix the certificate chain.</p>
+<p class="more">Go deeper: <a href="https://www.cloudflare.com/learning/ssl/what-happens-in-a-tls-handshake/">Cloudflare: the TLS handshake</a> · <a href="https://hpbn.co/transport-layer-security-tls/">HPBN: TLS</a></p>
+</article>
+
+<article class="topic" id="request-lifecycle" data-k="middleware next event loop pipeline error handler journey">
+<h3>Request / Response Lifecycle</h3>
+<p class="lede">Put the pieces together. This is one request to `POST https://api.shop.com/v1/orders`.</p>
+<div class="flow">
+<span><b>1</b>DNS lookup</span><i>→</i>
+<span><b>2</b>TCP handshake</span><i>→</i>
+<span><b>3</b>TLS handshake</span><i>→</i>
+<span><b>4</b>HTTP request</span><i>→</i>
+<span><b>5</b>Load balancer</span><i>→</i>
+<span class="hot"><b>6</b>Express middleware</span><i>→</i>
+<span class="hot"><b>7</b>Route handler</span><i>→</i>
+<span><b>8</b>Database</span><i>→</i>
+<span><b>9</b>Response</span>
+</div>
+<p>Steps 1 to 3 happen once per connection; later requests on it skip straight to step 4. Steps 6 and 7 are yours.</p>
+<p>Express models them as a chain of <b>middleware</b>: functions that receive `(req, res, next)`. Each one either ends the request by sending a response, or calls `next()` to pass it on. They run in the order you register them.</p>
+```ts
+// Runs for every request: log method, path, status and duration.
+app.use((req, res, next) => {
+  const start = performance.now();
+  res.on('finish', () => {
+    const ms = (performance.now() - start).toFixed(1);
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+  });
+  next();
+});
+```
+<div class="flow">
+<span>logger</span><i>→</i><span>express.json()</span><i>→</i><span>auth</span><i>→</i><span class="hot">route handler</span><i>→</i><span>response</span>
+<i>&nbsp;· any throw →</i><span>error handler</span>
+</div>
+<p>If anything throws, or an async handler's promise rejects, Express 5 skips ahead to the error handler from <a href="#project-setup">app.ts</a>.</p>
+<p class="pit"><b>Common mistake</b> A middleware path that neither responds nor calls `next()`. The request hangs until the client gives up, and nothing is logged. Every branch must do one or the other.</p>
+<p class="more">Go deeper: <a href="https://expressjs.com/en/guide/using-middleware.html">Express: using middleware</a></p>
+</article>
+</section>

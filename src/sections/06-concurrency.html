@@ -1,0 +1,203 @@
+<section class="cat" id="concurrency" data-title="Concurrency">
+<header class="cat-head">
+  <p class="eyebrow">06 · Foundations</p>
+  <h2>Concurrency</h2>
+  <p class="sum">Concurrency means several tasks in progress at the same time. Requests overlap on every server, including single-threaded Node, and bugs live in the overlap.</p>
+</header>
+
+<article class="topic" id="race-conditions" data-k="race check-then-act interleaving await toctou double spend concurrent requests">
+<h3>Race Conditions</h3>
+<p class="lede">A race condition is a bug where the result depends on which of two overlapping tasks happens to run first.</p>
+<p>The classic shape is <b>check, then act</b>. Suppose a `coupons` table with a `used` flag, and a coupon that should work once:</p>
+```ts
+// Broken: both requests can pass the check before either one writes.
+const { rows } = await pool.query('SELECT used FROM coupons WHERE code = $1', [code]);
+if (rows[0].used) throw new Error('Coupon already used');
+await pool.query('UPDATE coupons SET used = true WHERE code = $1', [code]);
+await applyDiscount(orderId);
+```
+<ol class="seq">
+<li><b>Request A</b><span>Reads `used = false`.</span></li>
+<li><b>Request B</b><span>Reads `used = false`. A has not written yet.</span></li>
+<li><b>Request A</b><span>Sets `used = true`, applies the discount.</span></li>
+<li><b>Request B</b><span>Sets `used = true`, applies the discount again.</span></li>
+</ol>
+<p>The check was true when it ran and stale by the time it was used. Node's single thread does not help: at every `await` the function pauses and other requests run. With several server instances, they run truly in parallel.</p>
+<p>Races pass tests, because tests send one request at a time. They show up under real traffic, rarely and without a stack trace. Three fixes follow in this chapter: make the step <a href="#atomic-operations">atomic</a>, take a <a href="#mutexes">lock</a>, or let a database constraint reject the loser.</p>
+<p class="pit"><b>Common mistake</b> "Node is single-threaded, so I have no race conditions." Single-threaded means two lines of JavaScript never run at the same instant. It says nothing about what happens between your `await`s.</p>
+<p class="more">Go deeper: <a href="https://owasp.org/www-community/vulnerabilities/Time_of_check_time_of_use">OWASP: time of check, time of use</a></p>
+</article>
+
+<article class="topic" id="atomic-operations" data-k="atomic indivisible compare-and-swap optimistic locking version on conflict incr upsert">
+<h3>Atomic Operations</h3>
+<p class="lede">An operation is atomic when it happens as one indivisible step: no other task can observe or interrupt it halfway. If the check and the write are one step, there is no gap to race in.</p>
+<p>You rarely build atomicity. You pick an operation that already has it.</p>
+```ts
+// The coupon, fixed: the WHERE is the check, the SET is the act, in one statement.
+const result = await pool.query(
+  'UPDATE coupons SET used = true WHERE code = $1 AND used = false',
+  [code],
+);
+if (result.rowCount === 0) throw new Error('Coupon already used');
+await applyDiscount(orderId);
+```
+<p>Two overlapping requests both run the statement; the database lets exactly one match the row.</p>
+<div class="tbl"><table>
+<tr><th>Need</th><th>Atomic tool</th></tr>
+<tr><td>Change a row only if a condition holds</td><td>`UPDATE … WHERE condition`, then read `rowCount`</td></tr>
+<tr><td>Create only if absent</td><td>A `UNIQUE` constraint with `INSERT … ON CONFLICT DO NOTHING`</td></tr>
+<tr><td>Count</td><td>`SET n = n + 1` in SQL, or `INCR` in <a href="#redis">Redis</a></td></tr>
+<tr><td>Several statements together</td><td>A <a href="#transactions">transaction</a></td></tr>
+</table></div>
+<p>When a person edits data over minutes, you cannot hold anything that long. Use <b>optimistic locking</b>: store a version number, and make the write conditional on it being unchanged since the read.</p>
+```ts
+const result = await pool.query(
+  `UPDATE products SET name = $2, version = version + 1
+    WHERE id = $1 AND version = $3`,
+  [id, name, versionTheClientRead],
+);
+if (result.rowCount === 0) {
+  res.status(409).json({ title: 'Product was changed by someone else', status: 409 });
+  return;
+}
+```
+<p class="pit"><b>Common mistake</b> Reading a value into JavaScript, changing it, and writing it back: `stock = row.stock - 1`. Two requests read 5 and both write 4. Send the arithmetic to the database: `SET stock = stock - 1`.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT">PostgreSQL: INSERT … ON CONFLICT</a></p>
+</article>
+
+<article class="topic" id="mutexes" data-k="mutex lock distributed lock redis set nx ttl fencing token for update in-process">
+<h3>Mutexes & Locks</h3>
+<p class="lede">Some critical sections cannot be squeezed into one atomic statement, for example "call the payment provider, then record the result". Then you take a <a href="#locks">lock</a>. A <b>mutex</b> is the simplest one: a single holder at a time.</p>
+<p>Which lock depends on who is competing:</p>
+<div class="tbl"><table>
+<tr><th>Competitors</th><th>Lock</th><th>Released when</th></tr>
+<tr><td>Async tasks in one process</td><td>In-process mutex</td><td>The task finishes</td></tr>
+<tr><td>Transactions on one row</td><td>`SELECT … FOR UPDATE` (see <a href="#acid">ACID</a>)</td><td>The transaction ends</td></tr>
+<tr><td>Several server instances</td><td>Distributed lock in Redis, or a Postgres <a href="#locks">advisory lock</a></td><td>Explicit release, or expiry</td></tr>
+</table></div>
+<p>An in-process mutex is a queue of promises. Each caller runs after the previous one settles:</p>
+```ts title=src/mutex.ts
+export class Mutex {
+  #tail: Promise<unknown> = Promise.resolve();
+
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.#tail.then(task);
+    this.#tail = result.catch(() => {});   // a failed task must not block the queue
+    return result;
+  }
+}
+```
+<p>Across servers, the lock has to live somewhere they all see. In Redis, "create this key only if it does not exist" is atomic, which makes it a lock:</p>
+```ts
+const key = `lock:invoice:${orderId}`;
+const token = crypto.randomUUID();                       // proves the lock is ours
+
+const acquired = await redis.set(key, token, {
+  condition: 'NX',                                       // only if the key is absent
+  expiration: { type: 'PX', value: 30_000 },             // auto-release after 30 s
+});
+if (!acquired) {
+  res.status(409).json({ title: 'Invoice is already being generated', status: 409 });
+  return;
+}
+try {
+  await generateInvoice(orderId);
+} finally {
+  // Delete only if the value is still our token (Redis 8.4+; older servers need a Lua script)
+  await redis.delEx(key, { condition: 'IFEQ', matchValue: token });
+}
+```
+<p>The expiry stops a crashed holder from blocking everyone forever. The token stops you deleting a lock that expired and now belongs to someone else.</p>
+<p class="pit"><b>Common mistake</b> Trusting a lock with an expiry as a hard guarantee. If the work outlasts the 30 seconds, a second holder starts while the first is still running. Use such locks to avoid duplicate work, and keep a database constraint as the final guard for correctness.</p>
+<p class="more">Go deeper: <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Martin Kleppmann: how to do distributed locking</a></p>
+</article>
+
+<article class="topic" id="thread-safety" data-k="thread-safe shared mutable state asynclocalstorage request context sharedarraybuffer atomics worker">
+<h3>Thread Safety</h3>
+<p class="lede">Code is thread-safe when it stays correct if several threads run it at the same time. The danger is always the same: <b>shared mutable state</b>, data that more than one task can change.</p>
+<p>Node's main thread gives you a head start. Code between two `await`s runs to completion with nothing interleaved. The equivalent bug appears when state shared between requests is used across an `await`:</p>
+```ts
+// Broken: one variable shared by every request.
+let currentUser: { id: string };
+
+app.use(async (req, res, next) => {
+  currentUser = await loadUser(req);    // request B overwrites this while A is still waiting
+  next();
+});
+```
+<p>Request A can now act as request B's user. Per-request data belongs on a per-request object, such as `res.locals`. For data that must reach deep code without being passed through every function, `AsyncLocalStorage` gives each request its own store:</p>
+```ts title=src/context.ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const store = new AsyncLocalStorage<{ requestId: string }>();
+
+app.use((_req, _res, next) => {
+  store.run({ requestId: crypto.randomUUID() }, next);   // everything this request triggers sees it
+});
+
+export const requestId = () => store.getStore()?.requestId;
+```
+<p><a href="#threads">Worker threads</a> are safe by default for a different reason: messages are copied, so nothing is shared. The exception is `SharedArrayBuffer`, real shared memory. There, plain operations race and only the `Atomics` functions are safe:</p>
+```ts
+const counter = new Int32Array(new SharedArrayBuffer(4));
+
+Atomics.add(counter, 0, 1);   // safe from any thread
+counter[0]++;                 // read, add, write: three steps another thread can interleave
+```
+<p class="pit"><b>Common mistake</b> Caches and counters in module-level variables. Within one process they work. With two instances each has its own copy, and the numbers disagree. Shared state belongs in Postgres or Redis.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/async_context.html">Node.js: asynchronous context tracking</a></p>
+</article>
+
+<article class="topic" id="producer-consumer" data-k="queue buffer backpressure worker pool bounded 202 accepted background decouple">
+<h3>Producer-Consumer Pattern</h3>
+<p class="lede">One part of the system creates work (the producer) and another does it (the consumer). A queue between them lets each run at its own speed.</p>
+<div class="flow">
+<span>Producer<b>route handler</b></span><i>push →</i><span class="hot">Queue</span><i>take →</i><span>Consumer 1</span><span>Consumer 2</span><span>Consumer 3</span>
+</div>
+<p>Three things follow from the queue:</p>
+<ul>
+<li><b>The producer does not wait.</b> The order route responds as soon as the email job is queued.</li>
+<li><b>Bursts are absorbed.</b> A spike fills the queue while consumers work through it at a steady rate.</li>
+<li><b>Consumers scale separately.</b> If the queue keeps growing, add consumers.</li>
+</ul>
+<p>The whole pattern fits in a few lines inside one process:</p>
+```ts title=src/job-queue.ts
+export class JobQueue<T> {
+  #items: T[] = [];
+  #waiting: ((item: T) => void)[] = [];
+
+  push(item: T) {
+    const consumer = this.#waiting.shift();
+    if (consumer) consumer(item);          // a consumer is idle: hand it over directly
+    else this.#items.push(item);
+  }
+
+  take(): Promise<T> {
+    const item = this.#items.shift();
+    if (item !== undefined) return Promise.resolve(item);
+    return new Promise((resolve) => this.#waiting.push(resolve));   // wait for the next push
+  }
+}
+```
+```ts
+const emails = new JobQueue<{ to: string; orderId: string }>();
+
+// Three consumers
+for (let i = 0; i < 3; i++) {
+  (async () => {
+    for (;;) {
+      const job = await emails.take();
+      await sendOrderEmail(job).catch(console.error);
+    }
+  })();
+}
+
+// Producer, inside the order route
+emails.push({ to: user.email, orderId: order.id });
+res.status(202).json(order);               // 202 Accepted: received, still processing
+```
+<p>A queue with no size limit only moves the overload into memory. A <b>bounded</b> queue pushes back when full, by making the producer wait or rejecting new work. That is the same backpressure idea as <a href="#io">streams</a>.</p>
+<p class="pit"><b>Common mistake</b> Running this in memory in production. A restart loses every queued job, and a second server cannot share the queue. Real systems put the queue in a separate durable service, which is the subject of <a href="#message-queues">Message Queues</a>.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#asynchronism">System Design Primer: asynchronism</a></p>
+</article>
+</section>

@@ -1,0 +1,291 @@
+<section class="cat" id="databases" data-title="Databases">
+<header class="cat-head">
+  <p class="eyebrow">03 · Data</p>
+  <h2>Databases</h2>
+  <p class="sum">The database outlives every deploy of your code. This chapter designs the shop's tables in PostgreSQL, queries them, makes the queries fast, and keeps the data correct when requests overlap.</p>
+</header>
+
+<article class="topic" id="relational-design" data-k="schema tables primary key foreign key constraint normalization one-to-many many-to-many junction">
+<h3>Relational Database Design</h3>
+<p class="lede">A relational database stores data in tables of rows, and links rows by reference so that each fact is stored once.</p>
+<ul>
+<li>A <b>primary key</b> uniquely identifies a row.</li>
+<li>A <b>foreign key</b> is a column holding another table's primary key. The database refuses values that point at nothing.</li>
+<li><b>Constraints</b> (`NOT NULL`, `UNIQUE`, `CHECK`) are rules the database enforces on every write, whichever code path wrote it.</li>
+</ul>
+```sql title=schema.sql
+CREATE TABLE users (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE products (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name        text NOT NULL,
+  price_cents integer NOT NULL CHECK (price_cents >= 0),
+  stock       integer NOT NULL CHECK (stock >= 0)
+);
+
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id     bigint NOT NULL REFERENCES users (id),
+  status      text NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending', 'paid', 'shipped', 'cancelled')),
+  total_cents integer NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+  order_id         bigint NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+  product_id       bigint NOT NULL REFERENCES products (id),
+  quantity         integer NOT NULL CHECK (quantity > 0),
+  unit_price_cents integer NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+```
+<div class="flow">
+<span>users</span><i>1 → many</i><span>orders</span><i>1 → many</i><span class="hot">order_items</span><i>many ← 1</i><span>products</span>
+</div>
+<p>Two relationship shapes cover almost everything:</p>
+<ul>
+<li><b>One to many</b>: a user has many orders. The "many" side holds the foreign key (`orders.user_id`).</li>
+<li><b>Many to many</b>: an order has many products and a product is in many orders. A table in between (`order_items`) holds one row per pairing.</li>
+</ul>
+<p>Storing each fact once is called <b>normalization</b>. The product name lives only in `products`, so renaming it is one update. `unit_price_cents` is a deliberate exception: it copies the price at purchase time, because an old order must not change when the price does.</p>
+<p class="pit"><b>Common mistake</b> Floating-point money (`0.1 + 0.2` is not `0.3`), and lists packed into one column such as `product_ids = '7,12,19'`, which the database can neither index nor check. Use integer cents and a junction table.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/ddl-constraints.html">PostgreSQL: constraints</a></p>
+</article>
+
+<article class="topic" id="sql" data-k="select insert update delete where group by returning pg pool parameter placeholder">
+<h3>SQL</h3>
+<p class="lede">SQL is declarative: you describe the rows you want and the database decides how to find them. Four statements do most of the work.</p>
+```sql
+-- Read: filter, order, limit
+SELECT id, status, total_cents
+  FROM orders
+ WHERE user_id = 42 AND status = 'paid'
+ ORDER BY created_at DESC
+ LIMIT 20;
+
+-- Create, and get generated columns back
+INSERT INTO products (name, price_cents, stock)
+VALUES ('Filter coffee', 24900, 50)
+RETURNING id;
+
+-- Change
+UPDATE orders SET status = 'shipped' WHERE id = 1042;
+
+-- Remove
+DELETE FROM orders WHERE id = 1042;
+
+-- Summarize: one output row per group
+SELECT status, count(*) AS orders, sum(total_cents) AS revenue_cents
+  FROM orders
+ GROUP BY status;
+```
+<p>From Node, queries go through a <b>connection pool</b>: a set of open database connections that requests borrow and return, so nobody pays the TCP and login cost per query.</p>
+```ts title=src/db.ts
+import { Pool } from 'pg';
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,   // postgres://user:pass@host:5432/shop
+  max: 10,                                      // at most 10 open connections
+});
+```
+```ts
+const { rows } = await pool.query(
+  'SELECT id, status FROM orders WHERE user_id = $1 AND status = $2',
+  [userId, 'paid'],
+);
+```
+<p>`$1` and `$2` are <b>placeholders</b>. The values travel to Postgres separately from the query text, so a value can never be read as SQL. One driver detail: `pg` returns `bigint` columns as strings, because JavaScript numbers lose precision above 2<sup>53</sup>.</p>
+<p class="pit"><b>Common mistake</b> An `UPDATE` or `DELETE` with no `WHERE` changes every row. Run the same condition as a `SELECT` first and read the row count.</p>
+<p class="more">Go deeper: <a href="https://sqlbolt.com/">SQLBolt interactive lessons</a> · <a href="https://node-postgres.com/features/pooling">node-postgres: pooling</a></p>
+</article>
+
+<article class="topic" id="joins" data-k="inner join left join n+1 combine tables any array">
+<h3>Joins</h3>
+<p class="lede">Normalized data is spread across tables. A join puts it back together by matching rows on a condition, usually foreign key = primary key.</p>
+```sql
+-- Everything on order 1042, with product names
+SELECT p.name, oi.quantity, oi.unit_price_cents
+  FROM order_items oi
+  JOIN products p ON p.id = oi.product_id
+ WHERE oi.order_id = 1042;
+
+-- Every user with their order count, including users with none
+SELECT u.email, count(o.id) AS orders
+  FROM users u
+  LEFT JOIN orders o ON o.user_id = u.id
+ GROUP BY u.id;
+```
+<div class="tbl"><table>
+<tr><th>Join</th><th>Keeps</th></tr>
+<tr><td>INNER JOIN (or JOIN)</td><td>Only rows that have a match on both sides</td></tr>
+<tr><td>LEFT JOIN</td><td>Every left row. Where nothing matches, the right side's columns are `NULL`.</td></tr>
+</table></div>
+<p>Those two cover nearly all application queries. In the second query, an inner join would silently drop users who have never ordered.</p>
+<p class="pit"><b>Common mistake</b> The N+1 query: fetch 20 orders, then loop and query the items of each. That is 21 round trips where one will do.</p>
+```ts
+// N+1: one query per order
+for (const order of orders) {
+  order.items = (await pool.query('SELECT * FROM order_items WHERE order_id = $1', [order.id])).rows;
+}
+
+// One query for all of them, then group in memory
+const ids = orders.map((o) => o.id);
+const { rows } = await pool.query('SELECT * FROM order_items WHERE order_id = ANY($1)', [ids]);
+const itemsByOrder = Map.groupBy(rows, (r) => r.order_id);
+```
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/tutorial-join.html">PostgreSQL tutorial: joins</a></p>
+</article>
+
+<article class="topic" id="indexes" data-k="b-tree composite partial covering unique seq scan create index concurrently">
+<h3>Indexes</h3>
+<p class="lede">Without an index, finding one user's orders means reading every row in the table (a sequential scan). An index is a separate sorted structure that leads straight to the matching rows.</p>
+<p>The default kind is a <b>B-tree</b>: a balanced tree kept in sorted order. Finding a value takes a handful of steps even across millions of rows, the way a phone book lets you skip to a surname. Because it is sorted, it also serves ranges (`created_at > …`) and `ORDER BY`.</p>
+```sql
+-- "A user's orders, newest first": matches the WHERE and the ORDER BY
+CREATE INDEX orders_user_created_idx ON orders (user_id, created_at DESC);
+
+-- Partial index: covers only the rows a job actually looks for
+CREATE INDEX orders_pending_idx ON orders (created_at) WHERE status = 'pending';
+```
+<ul>
+<li><b>Column order matters</b> in a multi-column index. `(user_id, created_at)` is sorted by user first, so it helps `WHERE user_id = 42` but barely helps `WHERE created_at > …` alone.</li>
+<li><b>Primary keys and `UNIQUE` columns</b> are indexed automatically. <b>Foreign keys are not</b> in Postgres: index `orders.user_id` yourself.</li>
+<li><b>Indexes cost writes.</b> Every insert and update must maintain each one. Add them for queries you actually run.</li>
+</ul>
+<p>On a live table, use `CREATE INDEX CONCURRENTLY` so writes are not blocked while the index builds.</p>
+<p class="pit"><b>Common mistake</b> Wrapping the indexed column in a function. `WHERE lower(email) = 'a@b.com'` cannot use an index on `email`, because the index stores the original values. Index the expression: `CREATE INDEX ON users (lower(email))`.</p>
+<p class="more">Go deeper: <a href="https://use-the-index-luke.com/">Use The Index, Luke</a> · <a href="https://www.postgresql.org/docs/current/indexes.html">PostgreSQL: indexes</a></p>
+</article>
+
+<article class="topic" id="transactions" data-k="begin commit rollback atomic pool.connect client release withTransaction">
+<h3>Transactions</h3>
+<p class="lede">Placing an order takes three writes: reduce stock, insert the order, insert its items. If the process dies after the first, stock is gone and no order exists. A transaction groups statements so that all of them take effect or none do.</p>
+<p>`BEGIN` starts one, `COMMIT` makes it permanent, `ROLLBACK` discards it. A transaction belongs to one connection, so borrow a single client from the pool for its whole duration. `pool.query` may use a different connection for each call.</p>
+```ts title=src/db.ts
+import type { PoolClient } from 'pg';
+
+export async function withTransaction<T>(
+  work: (tx: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();              // always return the connection to the pool
+  }
+}
+```
+```ts title=src/orders.ts
+import { withTransaction } from './db.ts';
+
+export function placeOrder(userId: string, productId: number, quantity: number) {
+  return withTransaction(async (tx) => {
+    // Check and decrement in one statement: succeeds only if enough stock remains
+    const product = await tx.query(
+      `UPDATE products SET stock = stock - $2
+        WHERE id = $1 AND stock >= $2
+        RETURNING price_cents`,
+      [productId, quantity],
+    );
+    if (product.rowCount === 0) throw new Error('Out of stock');
+
+    const price = product.rows[0].price_cents;
+    const order = await tx.query(
+      'INSERT INTO orders (user_id, total_cents) VALUES ($1, $2) RETURNING id, status',
+      [userId, price * quantity],
+    );
+    await tx.query(
+      `INSERT INTO order_items (order_id, product_id, quantity, unit_price_cents)
+       VALUES ($1, $2, $3, $4)`,
+      [order.rows[0].id, productId, quantity, price],
+    );
+    return order.rows[0];
+  });
+}
+```
+<p>If either insert fails, the rollback also restores the stock.</p>
+<p class="pit"><b>Common mistake</b> Slow work inside a transaction, such as calling a payment API. The transaction holds its row locks and one pooled connection the whole time. With `max: 10`, ten slow calls stall every other request. Keep transactions short and do network calls outside them.</p>
+<p class="more">Go deeper: <a href="https://node-postgres.com/features/transactions">node-postgres: transactions</a></p>
+</article>
+
+<article class="topic" id="acid" data-k="atomicity consistency isolation durability isolation level read committed repeatable read serializable wal lost update for update">
+<h3>ACID Properties</h3>
+<p class="lede">ACID names the four guarantees a transaction gives you. Each one removes a class of bug you would otherwise handle in application code.</p>
+<div class="tbl"><table>
+<tr><th>Property</th><th>Guarantee</th><th>In the shop</th></tr>
+<tr><td>Atomicity</td><td>All statements apply, or none</td><td>No stock deducted without an order</td></tr>
+<tr><td>Consistency</td><td>Constraints hold at every commit</td><td>`stock >= 0` can never be violated</td></tr>
+<tr><td>Isolation</td><td>Concurrent transactions do not see each other's unfinished work</td><td>Two buyers cannot both take the last item</td></tr>
+<tr><td>Durability</td><td>Once committed, it survives a crash</td><td>A confirmed order is still there after a power cut</td></tr>
+</table></div>
+<p>Durability comes from the <b>write-ahead log</b> (WAL): Postgres appends each change to a log on disk before confirming the commit, and replays it after a crash.</p>
+<p>Isolation is the one with a dial. Stricter levels prevent more anomalies and make more transactions wait or fail.</p>
+<div class="tbl"><table>
+<tr><th>Level in Postgres</th><th>What a transaction sees</th><th>Cost</th></tr>
+<tr><td>Read committed (default)</td><td>Each statement sees whatever was committed before that statement began. Two reads in one transaction can differ.</td><td>Lowest</td></tr>
+<tr><td>Repeatable read</td><td>One snapshot for the whole transaction</td><td>Fails with error `40001` if a row it updates changed underneath it</td></tr>
+<tr><td>Serializable</td><td>Results match running the transactions one at a time</td><td>More `40001` failures. Your code must retry.</td></tr>
+</table></div>
+<p class="pit"><b>Common mistake</b> Read, decide in JavaScript, then write. Under the default level, two requests can both read `stock = 1`, both decide to proceed, and both write. Either let one statement do the check and the write, as `placeOrder` does, or lock the row while you decide:</p>
+```sql
+BEGIN;
+SELECT stock FROM products WHERE id = 7 FOR UPDATE;   -- other writers to this row now wait
+-- decide in application code
+UPDATE products SET stock = stock - 1 WHERE id = 7;
+COMMIT;
+```
+<p>This overlap problem is a <a href="#race-conditions">race condition</a>, the subject of the Concurrency chapter.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/transaction-iso.html">PostgreSQL: transaction isolation</a></p>
+</article>
+
+<article class="topic" id="query-optimization" data-k="explain analyze plan seq scan index scan slow query pg_stat_statements buffers">
+<h3>Query Optimization</h3>
+<p class="lede">The database turns each query into a <b>plan</b>: which indexes to use and in what order to join. Optimizing means reading the plan, finding the expensive step, and changing the query or the schema so a cheaper plan exists.</p>
+<ol>
+<li><b>Find the query that matters.</b> The `pg_stat_statements` extension ranks queries by total time. A 5 ms query that runs a million times a day outranks a 2 s report that runs once.</li>
+<li><b>Ask for its plan</b> with `EXPLAIN ANALYZE`, which runs the query and reports what happened.</li>
+<li><b>Fix the biggest cost</b>, then measure again.</li>
+</ol>
+```sql
+EXPLAIN ANALYZE
+SELECT id, total_cents FROM orders
+ WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+```text title=before (illustrative output)
+Limit  (actual time=61.2..61.3 rows=20)
+  ->  Sort  (actual time=61.2..61.2 rows=20)
+        ->  Seq Scan on orders  (actual time=0.4..61.0 rows=48)
+              Filter: (user_id = 42)
+              Rows Removed by Filter: 999952
+Execution Time: 61.4 ms
+```
+<p>Read it from the innermost line outward. Postgres read a million rows to keep 48, then sorted them. After adding the index from <a href="#indexes">Indexes</a>:</p>
+```text title=after
+Limit  (actual time=0.03..0.06 rows=20)
+  ->  Index Scan using orders_user_created_idx on orders  (actual time=0.03..0.05 rows=20)
+        Index Cond: (user_id = 42)
+Execution Time: 0.1 ms
+```
+<p>No scan, no sort: the index is already in the right order, so Postgres stops after 20 rows.</p>
+<h4>What to look for</h4>
+<ul>
+<li><b>Seq Scan with a large "Rows Removed by Filter"</b>: a missing index.</li>
+<li><b>Estimated rows far from actual rows</b>: stale statistics. Run `ANALYZE orders`.</li>
+<li><b>The same query hundreds of times per request</b>: an <a href="#joins">N+1</a>. No single plan will show it.</li>
+<li><b>Fetching more than you use</b>: `SELECT *`, or a missing `LIMIT`.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> Forgetting that `EXPLAIN ANALYZE` executes the statement. On an `UPDATE` or `DELETE` it changes data. Wrap it in `BEGIN; … ROLLBACK;`.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/using-explain.html">PostgreSQL: using EXPLAIN</a></p>
+</article>
+</section>

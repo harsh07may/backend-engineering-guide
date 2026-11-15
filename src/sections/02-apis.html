@@ -1,0 +1,306 @@
+<section class="cat" id="apis" data-title="APIs">
+<header class="cat-head">
+  <p class="eyebrow">02 · Building APIs</p>
+  <h2>APIs</h2>
+  <p class="sum">An API is a contract: these URLs, these inputs, these outputs. This chapter builds the orders API's contract and the rules that keep it predictable for the people calling it.</p>
+</header>
+
+<article class="topic" id="rest" data-k="resource representation router nouns urls restful">
+<h3>REST</h3>
+<p class="lede">REST is a style for HTTP APIs: model your system as <b>resources</b> (nouns such as orders and products), give each a URL, and act on them with the standard HTTP methods.</p>
+<div class="tbl"><table>
+<tr><th>Request</th><th>Meaning</th></tr>
+<tr><td>GET /v1/orders</td><td>List orders</td></tr>
+<tr><td>POST /v1/orders</td><td>Create an order</td></tr>
+<tr><td>GET /v1/orders/1042</td><td>Read one order</td></tr>
+<tr><td>PATCH /v1/orders/1042</td><td>Change part of it</td></tr>
+<tr><td>DELETE /v1/orders/1042</td><td>Remove it</td></tr>
+<tr><td>GET /v1/orders/1042/items</td><td>A nested resource: the items of that order</td></tr>
+</table></div>
+<p>The payoff is predictability. Someone who has seen `/orders` can guess `/products` without reading docs. An Express <b>Router</b> groups the routes of one resource:</p>
+```ts title=src/routes/orders.ts
+import { Router } from 'express';
+
+export const orders = Router();
+
+orders.get('/', listOrders);
+orders.post('/', createOrder);
+orders.get('/:id', getOrder);        // :id is available as req.params.id
+orders.patch('/:id', updateOrder);
+orders.delete('/:id', cancelOrder);
+```
+```ts title=src/app.ts
+import { orders } from './routes/orders.ts';
+
+app.use('/v1/orders', orders);
+```
+<p class="pit"><b>Common mistake</b> Verbs in URLs: `POST /createOrder`, `GET /getOrderById`. The method is already the verb. When an action is not plain create, read, update or delete, name the thing it produces: `POST /v1/orders/1042/refunds`.</p>
+<p class="more">Go deeper: <a href="https://learn.microsoft.com/en-us/azure/architecture/best-practices/api-design">Microsoft: RESTful API design</a> · <a href="https://expressjs.com/en/guide/routing.html">Express routing</a></p>
+</article>
+
+<article class="topic" id="http-methods" data-k="get post put patch delete safe idempotent retry">
+<h3>HTTP Methods</h3>
+<p class="lede">The method states intent. Two properties decide how clients and proxies may treat a request.</p>
+<ul>
+<li><b>Safe</b>: it only reads. Nothing changes on the server.</li>
+<li><b>Idempotent</b>: sending it twice leaves the server in the same state as sending it once.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>Method</th><th>Intent</th><th>Safe</th><th>Idempotent</th></tr>
+<tr><td>GET</td><td>Read</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>POST</td><td>Create, or trigger an action</td><td>No</td><td>No</td></tr>
+<tr><td>PUT</td><td>Replace the whole resource</td><td>No</td><td>Yes</td></tr>
+<tr><td>PATCH</td><td>Change some fields</td><td>No</td><td>Not guaranteed</td></tr>
+<tr><td>DELETE</td><td>Remove</td><td>No</td><td>Yes</td></tr>
+</table></div>
+<p>This matters when the network fails mid-request and the client cannot tell whether the server acted. Retrying a GET, PUT or DELETE is harmless. Retrying a POST may create a second order. Making POST retry-safe needs an idempotency key, covered in <a href="#idempotency">Idempotency</a>.</p>
+<p>PUT sends the full resource, so a missing field means "clear it". PATCH sends only what changes.</p>
+<p class="pit"><b>Common mistake</b> A GET that changes data, such as `GET /orders/1042/cancel`. Browsers prefetch links, crawlers follow them and caches replay them, so the order gets cancelled by something that only meant to look.</p>
+<p class="more">Go deeper: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods">MDN: HTTP request methods</a></p>
+</article>
+
+<article class="topic" id="status-codes" data-k="200 201 204 400 401 403 404 409 422 429 500 502 503 504 location">
+<h3>Status Codes</h3>
+<p class="lede">The status code is the outcome in three digits. Clients, proxies and monitoring all act on it before reading the body, so it has to be honest.</p>
+<div class="tbl"><table>
+<tr><th>Code</th><th>Meaning</th><th>Use it when</th></tr>
+<tr><td class="num">200</td><td>OK</td><td>A read or update succeeded</td></tr>
+<tr><td class="num">201</td><td>Created</td><td>A POST created something. Add a `Location` header.</td></tr>
+<tr><td class="num">204</td><td>No Content</td><td>Success with nothing to return, such as a DELETE</td></tr>
+<tr><td class="num">400</td><td>Bad Request</td><td>The request is malformed, such as broken JSON</td></tr>
+<tr><td class="num">401</td><td>Unauthorized</td><td>You have not proven who you are</td></tr>
+<tr><td class="num">403</td><td>Forbidden</td><td>We know who you are and you may not do this</td></tr>
+<tr><td class="num">404</td><td>Not Found</td><td>No such resource</td></tr>
+<tr><td class="num">409</td><td>Conflict</td><td>Clashes with current state, such as a duplicate email</td></tr>
+<tr><td class="num">422</td><td>Unprocessable Content</td><td>Well-formed, but fails validation</td></tr>
+<tr><td class="num">429</td><td>Too Many Requests</td><td>Rate limit hit</td></tr>
+<tr><td class="num">500</td><td>Internal Server Error</td><td>A bug on our side</td></tr>
+<tr><td class="num">502 / 503 / 504</td><td>Bad Gateway / Unavailable / Timeout</td><td>Usually sent by the proxy when the app is down or slow</td></tr>
+</table></div>
+<p>The first digit carries most of the meaning: 2xx worked, 3xx look elsewhere, 4xx the caller must change the request, 5xx the server failed and a retry may help.</p>
+```ts
+res.status(201).location(`/v1/orders/${order.id}`).json(order);   // created
+res.sendStatus(204);                                              // deleted
+res.status(404).json({ title: 'Order not found', status: 404 });  // missing
+```
+<p class="pit"><b>Common mistake</b> Returning 200 with `{ "error": "…" }` in the body. Retries, alerts and dashboards all read the status, so they record the failure as a success.</p>
+<p class="more">Go deeper: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Status">MDN: HTTP response status codes</a></p>
+</article>
+
+<article class="topic" id="api-design" data-k="validation zod schema error format problem details rfc 9457 contract naming">
+<h3>API Design</h3>
+<p class="lede">Good design means callers can predict your API. Three habits get most of the way: validate every input at the door, fail in one consistent shape, and name things consistently.</p>
+<h4>Validate at the door</h4>
+<p>Everything from the network is untrusted. A Zod schema describes the valid shape; `parse` returns typed data or throws.</p>
+```ts title=src/routes/orders.ts
+import * as z from 'zod';
+
+const CreateOrder = z.object({
+  productId: z.number().int().positive(),
+  quantity: z.number().int().min(1).max(99),
+});
+
+orders.post('/', async (req, res) => {
+  const input = CreateOrder.parse(req.body);          // throws ZodError if invalid
+  const order = await placeOrder(res.locals.user.id, input.productId, input.quantity);
+  res.status(201).location(`/v1/orders/${order.id}`).json(order);
+});
+```
+<p>`res.locals.user` is set by the <a href="#authentication">authentication</a> middleware and `placeOrder` is written in <a href="#transactions">Transactions</a>.</p>
+<h4>One error shape</h4>
+<p>Handlers throw; the single error handler translates. The shape below is Problem Details (RFC 9457), a standard JSON format for HTTP errors.</p>
+```ts title=src/app.ts
+const onError: ErrorRequestHandler = (err, _req, res, _next) => {
+  if (err instanceof z.ZodError) {
+    res.status(422).type('application/problem+json').json({
+      title: 'Invalid request',
+      status: 422,
+      errors: z.flattenError(err).fieldErrors,   // { quantity: ['Too big: …'] }
+    });
+    return;
+  }
+  console.error(err);
+  res.status(500).type('application/problem+json').json({ title: 'Internal Server Error', status: 500 });
+};
+```
+<h4>Naming</h4>
+<ul>
+<li>Plural nouns for collections: `/orders`, `/orders/1042`.</li>
+<li>One casing for JSON fields everywhere. This guide uses camelCase in JSON and snake_case in SQL.</li>
+<li>Timestamps as ISO 8601 in UTC: `2026-11-15T03:47:00Z`. Money as integer minor units: `1999`, not `19.99`.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> Sending `err.message` or a stack trace to the client. It leaks table names and file paths. Log the detail on the server and return a generic 500.</p>
+<p class="more">Go deeper: <a href="https://www.rfc-editor.org/rfc/rfc9457.html">RFC 9457: Problem Details</a> · <a href="https://zod.dev">Zod docs</a></p>
+</article>
+
+<article class="topic" id="pagination" data-k="limit offset cursor keyset page next infinite scroll">
+<h3>Pagination</h3>
+<p class="lede">A user with 50,000 orders must not get them in one response. Pagination returns a slice and a way to ask for the next one.</p>
+<div class="tbl"><table>
+<tr><th></th><th>Offset</th><th>Cursor (keyset)</th></tr>
+<tr><td>Request</td><td>`?limit=20&offset=40`</td><td>`?limit=20&cursor=1022`</td></tr>
+<tr><td>SQL</td><td>`LIMIT 20 OFFSET 40`</td><td>`WHERE id < 1022 LIMIT 20`</td></tr>
+<tr><td>Jump to page N</td><td>Yes</td><td>No, only next</td></tr>
+<tr><td>Deep pages</td><td>Slow: the database reads and discards every skipped row</td><td>Fast at any depth with an index</td></tr>
+<tr><td>Rows added meanwhile</td><td>Items repeat or get skipped</td><td>Stable</td></tr>
+</table></div>
+<p>Offset suits small admin tables. For feeds and anything large, use a cursor: the client sends back the last id it saw.</p>
+```ts title=src/routes/orders.ts
+const Page = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),   // query values are strings
+  cursor: z.coerce.number().int().positive().optional(),
+});
+
+orders.get('/', async (req, res) => {
+  const { limit, cursor } = Page.parse(req.query);
+  const { rows } = await pool.query(
+    `SELECT id, status, total_cents, created_at
+       FROM orders
+      WHERE user_id = $1 AND ($2::bigint IS NULL OR id < $2)
+      ORDER BY id DESC
+      LIMIT $3`,
+    [res.locals.user.id, cursor ?? null, limit + 1],   // one extra row tells us if more exist
+  );
+  const data = rows.slice(0, limit);
+  res.json({ data, nextCursor: rows.length > limit ? data.at(-1).id : null });
+});
+```
+<p>`pool` is the Postgres connection pool from <a href="#sql">SQL</a>.</p>
+<p class="pit"><b>Common mistake</b> No upper bound on `limit`. One request for `?limit=10000000` then loads the whole table into memory.</p>
+<p class="more">Go deeper: <a href="https://use-the-index-luke.com/no-offset">Use The Index, Luke: paging without OFFSET</a></p>
+</article>
+
+<article class="topic" id="filtering-sorting" data-k="query string where order by allow-list whitelist sort">
+<h3>Filtering &amp; Sorting</h3>
+<p class="lede">Clients ask for the subset and order they need through the query string: `GET /v1/orders?status=paid&sort=-created_at`. A leading `-` is a common convention for descending.</p>
+<p>The rule that keeps this safe: <b>values</b> go to the database as parameters, and <b>column names</b> come from a fixed allow-list. SQL parameters cannot stand in for column names, so anything outside the list is rejected.</p>
+```ts title=src/routes/orders.ts
+const SORTABLE: Record<string, string> = {   // API name -> real column
+  created_at: 'created_at',
+  total: 'total_cents',
+};
+
+const Filter = z.object({
+  status: z.enum(['pending', 'paid', 'shipped', 'cancelled']).optional(),
+  sort: z.string().default('-created_at'),
+});
+
+orders.get('/search', async (req, res) => {          // register before '/:id'
+  const { status, sort } = Filter.parse(req.query);
+  const column = SORTABLE[sort.replace(/^-/, '')];
+  if (!column) {
+    res.status(400).json({ title: `Cannot sort by "${sort}"`, status: 400 });
+    return;
+  }
+  const direction = sort.startsWith('-') ? 'DESC' : 'ASC';
+
+  const { rows } = await pool.query(
+    `SELECT id, status, total_cents, created_at
+       FROM orders
+      WHERE user_id = $1 AND ($2::text IS NULL OR status = $2)
+      ORDER BY ${column} ${direction}
+      LIMIT 50`,
+    [res.locals.user.id, status ?? null],
+  );
+  res.json({ data: rows });
+});
+```
+<p>`column` and `direction` can only ever be strings this file wrote, which is what makes the interpolation safe. In a real API the filter, sort and <a href="#pagination">pagination</a> live in the same list endpoint; they are separate here to keep each idea visible.</p>
+<p class="pit"><b>Common mistake</b> Putting `req.query.sort` straight into the SQL string. That is SQL injection: the caller can append their own SQL. The attack is covered in <a href="#sql-injection">SQL Injection</a>.</p>
+<p class="more">Go deeper: <a href="https://node-postgres.com/features/queries">node-postgres: parameterized queries</a></p>
+</article>
+
+<article class="topic" id="authentication" data-k="authn login bearer token session cookie 401 identity res.locals">
+<h3>Authentication</h3>
+<p class="lede">Authentication answers "who is making this request?". Because HTTP is stateless, the proof travels with every request.</p>
+<div class="tbl"><table>
+<tr><th>Carrier</th><th>How it works</th><th>Typical client</th></tr>
+<tr><td>Session cookie</td><td>The server stores the session and the browser sends back its id automatically</td><td>Web apps</td></tr>
+<tr><td>Bearer token</td><td>The client sends `Authorization: Bearer <token>`. Often a JWT, a signed token the server can verify without a lookup.</td><td>Mobile apps, other services</td></tr>
+<tr><td>API key</td><td>A long random secret that identifies an application, not a person</td><td>Server-to-server</td></tr>
+</table></div>
+<p>Whichever you choose, the Express shape is the same: one middleware verifies the credential and attaches the identity for later handlers.</p>
+```ts title=src/middleware/auth.ts
+import type { RequestHandler } from 'express';
+
+export const authenticate: RequestHandler = async (req, res, next) => {
+  const token = req.get('authorization')?.match(/^Bearer (.+)$/)?.[1];
+  const user = token ? await verifyToken(token) : null;   // returns { id, role } or null
+
+  if (!user) {
+    res.status(401).set('WWW-Authenticate', 'Bearer').json({ title: 'Unauthorized', status: 401 });
+    return;
+  }
+  res.locals.user = user;
+  next();
+};
+```
+```ts title=src/app.ts
+app.use('/v1/orders', authenticate, orders);   // every orders route now requires a user
+```
+<p>`verifyToken` is deliberately left open here. It is written in <a href="#jwt">JWT</a>; <a href="#sessions">Sessions</a> shows the cookie-based alternative.</p>
+<p class="pit"><b>Common mistake</b> Credentials in the URL, such as `?api_key=…`. URLs are written to access logs, browser history and analytics. Send secrets in a header.</p>
+<p class="more">Go deeper: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication">MDN: HTTP authentication</a></p>
+</article>
+
+<article class="topic" id="authorization" data-k="authz permissions roles rbac ownership 403 idor bola access control">
+<h3>Authorization</h3>
+<p class="lede">Authentication established who you are. Authorization decides what you may do. It needs two separate checks.</p>
+<ul>
+<li><b>Role check</b>: may this kind of user call this endpoint at all? Only admins refund orders.</li>
+<li><b>Ownership check</b>: may this user touch this particular record? You read your own orders only.</li>
+</ul>
+```ts title=src/middleware/auth.ts
+export const requireRole = (...roles: string[]): RequestHandler => (_req, res, next) => {
+  if (roles.includes(res.locals.user.role)) return next();
+  res.status(403).json({ title: 'Forbidden', status: 403 });
+};
+```
+```ts title=src/routes/orders.ts
+orders.post('/:id/refunds', requireRole('admin'), refundOrder);   // role check
+
+orders.get('/:id', async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, status, total_cents FROM orders WHERE id = $1 AND user_id = $2',   // ownership check
+    [req.params.id, res.locals.user.id],
+  );
+  if (!rows[0]) {
+    res.status(404).json({ title: 'Order not found', status: 404 });
+    return;
+  }
+  res.json(rows[0]);
+});
+```
+<p>The ownership check lives inside the query, so there is no code path that fetches the order without it. Someone else's order returns 404 and not 403, so the response does not confirm that the id exists.</p>
+<p class="pit"><b>Common mistake</b> Checking that the user is logged in and then running `WHERE id = $1` alone. Any user can read any order by changing the number in the URL. This is the most common serious API flaw; OWASP calls it broken object level authorization.</p>
+<p class="more">Go deeper: <a href="https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/">OWASP API1: Broken Object Level Authorization</a></p>
+</article>
+
+<article class="topic" id="versioning" data-k="v1 v2 breaking change deprecation sunset header backwards compatible">
+<h3>API Versioning</h3>
+<p class="lede">Once other people's code calls your API, you cannot change it freely. Versioning lets you make incompatible changes while old clients keep working.</p>
+<div class="tbl"><table>
+<tr><th>Safe to ship in place</th><th>Breaking: needs a new version</th></tr>
+<tr><td style="white-space:normal;font-weight:400">Adding an endpoint<br>Adding an optional request field<br>Adding a response field</td><td>Removing or renaming a field<br>Changing a field's type or meaning<br>Making an optional field required</td></tr>
+</table></div>
+<p>The common scheme is a version in the path, because it is visible and easy to route. Each version is its own Router:</p>
+```ts title=src/app.ts
+app.use('/v1/orders', authenticate, deprecated, ordersV1);
+app.use('/v2/orders', authenticate, ordersV2);
+```
+<p>Retire the old version in the open. Two standard response headers tell clients it is deprecated and when it stops working:</p>
+```ts
+const deprecated: RequestHandler = (_req, res, next) => {
+  res.set({
+    Deprecation: '@1796083200',                   // deprecated since 1 Dec 2026 (Unix time)
+    Sunset: 'Wed, 30 Jun 2027 23:59:59 GMT',      // stops working after this
+    Link: '</v2/orders>; rel="successor-version"',
+  });
+  next();
+};
+```
+<p>The alternatives are a version in a header, or dated versions pinned per account as Stripe does. Both keep URLs clean and are harder to test from a browser.</p>
+<p class="pit"><b>Common mistake</b> Creating v2 for every change. Most changes can be additive. Each live version is code you must keep working, so add fields where you can and version only when you must break.</p>
+<p class="more">Go deeper: <a href="https://stripe.com/blog/api-versioning">Stripe: API versioning</a> · <a href="https://www.rfc-editor.org/rfc/rfc9745.html">RFC 9745: Deprecation header</a></p>
+</article>
+</section>

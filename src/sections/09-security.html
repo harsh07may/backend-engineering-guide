@@ -1,0 +1,381 @@
+<section class="cat" id="security" data-title="Security">
+<header class="cat-head">
+  <p class="eyebrow">09 · Building APIs</p>
+  <h2>Security</h2>
+  <p class="sum">Every input is written by a stranger, and some strangers are hostile. This chapter covers how to prove who a user is, and the handful of attacks that account for most real breaches.</p>
+</header>
+
+<article class="topic" id="password-hashing" data-k="argon2 argon2id bcrypt salt hash slow memory-hard owasp verify login register">
+<h3>Password Hashing</h3>
+<p class="lede">Databases leak. If yours holds passwords in readable form, every user's password leaks with it, and people reuse passwords. So you never store the password, only a value derived from it that cannot be turned back.</p>
+<p>A <b>hash function</b> is that one-way derivation. At login you hash what the user typed and compare. Two details separate a safe scheme from a broken one:</p>
+<ul>
+<li><b>Salt</b>: a random value stored with each hash and mixed into it. Two users with the same password get different hashes, and an attacker cannot use a precomputed table of common passwords.</li>
+<li><b>Deliberate slowness</b>: general hashes such as SHA-256 are built for speed, and a graphics card tries billions per second. Password hashes are built to be slow and to need a lot of memory, which makes guessing expensive.</li>
+</ul>
+<p>The current recommendation is <b>Argon2id</b>. Node ships it in `node:crypto`. The cost settings below are OWASP's minimum: 19 MiB of memory, 2 passes.</p>
+```ts title=src/passwords.ts
+import { argon2, randomBytes, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
+
+const derive = promisify(argon2);
+const cost = { memory: 19_456, passes: 2, parallelism: 1, tagLength: 32 };   // memory in KiB
+
+export async function hashPassword(password: string) {
+  const salt = randomBytes(16);
+  const hash = await derive('argon2id', { message: password, nonce: salt, ...cost });
+  return `${salt.toString('base64')}.${hash.toString('base64')}`;            // store this string
+}
+
+export async function verifyPassword(password: string, stored: string) {
+  const [salt, hash] = stored.split('.').map((part) => Buffer.from(part, 'base64'));
+  const attempt = await derive('argon2id', { message: password, nonce: salt, ...cost });
+  return timingSafeEqual(hash, attempt);     // comparison time does not depend on where they differ
+}
+```
+<p>Node's docs still mark `crypto.argon2` as a release candidate. The `argon2` package on npm is the long-standing alternative and stores the salt and settings in one string for you.</p>
+<p class="pit"><b>Common mistake</b> Different login errors for "no such user" and "wrong password". That tells an attacker which emails have accounts. Return one message for both: "Invalid email or password".</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html">OWASP Password Storage Cheat Sheet</a></p>
+</article>
+
+<article class="topic" id="sessions" data-k="session cookie httponly secure samesite express-session connect-redis logout regenerate fixation">
+<h3>Sessions</h3>
+<p class="lede">HTTP forgets you between requests. A session is the server's memory of a logged-in user: after login the server stores a record and gives the browser a random id for it in a cookie. The browser sends the cookie back on every request.</p>
+<div class="flow">
+<span>Login OK</span><i>→</i><span class="hot">Redis<b>sess:9f2c… → { userId: 42 }</b></span><i>→</i><span>Set-Cookie: sid=9f2c…</span><i>→</i><span>Later requests send the cookie</span>
+</div>
+<p>The id means nothing by itself; all the data stays on the server. Deleting the record logs the user out at once.</p>
+```bash
+npm i express-session connect-redis && npm i -D @types/express-session
+```
+```ts title=src/app.ts
+import session from 'express-session';
+import { RedisStore } from 'connect-redis';
+import { redis } from './redis.ts';
+
+declare module 'express-session' {
+  interface SessionData { userId: string }          // what we keep in the session
+}
+
+app.use(session({
+  store: new RedisStore({ client: redis }),
+  secret: config.SESSION_SECRET,                    // signs the cookie so ids cannot be forged
+  name: 'sid',
+  resave: false,
+  saveUninitialized: false,                         // no session until someone logs in
+  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 },
+}));
+```
+<div class="tbl"><table>
+<tr><th>Cookie flag</th><th>Effect</th></tr>
+<tr><td>HttpOnly</td><td>JavaScript in the page cannot read the cookie (limits <a href="#xss">XSS</a> damage)</td></tr>
+<tr><td>Secure</td><td>Sent over HTTPS only</td></tr>
+<tr><td>SameSite=Lax</td><td>Not sent on requests started by other sites, except plain link clicks (limits <a href="#csrf">CSRF</a>)</td></tr>
+</table></div>
+```ts title=src/routes/auth.ts
+auth.post('/login', async (req, res) => {
+  const { email, password } = Login.parse(req.body);
+  const { rows } = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
+
+  if (!rows[0] || !(await verifyPassword(password, rows[0].password_hash))) {
+    res.status(401).json({ title: 'Invalid email or password', status: 401 });
+    return;
+  }
+  req.session.regenerate(() => {                    // new id at login
+    req.session.userId = rows[0].id;
+    res.json({ ok: true });
+  });
+});
+
+auth.post('/logout', (req, res) => {
+  req.session.destroy(() => res.clearCookie('sid').sendStatus(204));
+});
+```
+<p class="pit"><b>Common mistake</b> Keeping the same session id across login. An attacker who planted an id in the victim's browser beforehand is then logged in too (session fixation). `regenerate` issues a fresh id.</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html">OWASP Session Management Cheat Sheet</a></p>
+</article>
+
+<article class="topic" id="jwt" data-k="json web token jose signature claims exp bearer access token refresh token stateless verifyToken">
+<h3>JWT</h3>
+<p class="lede">A JSON Web Token carries the user's identity inside the token itself, with a signature that proves the server issued it. The server verifies the signature and needs no lookup.</p>
+```text title=three base64url parts, separated by dots
+eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiI0MiIsInJvbGUiOiJjdXN0b21lciIsImV4cCI6MTc5NDcxOTAwMH0 . 3kF…signature
+header: {"alg":"HS256"}  payload: {"sub":"42","role":"customer","exp":1794719000}
+```
+<p>The payload's fields are called <b>claims</b>. Standard ones: `sub` (who), `exp` (expiry), `iss` (issuer), `aud` (intended audience). The payload is only encoded, so anyone holding the token can read it. The signature stops them changing it.</p>
+<p>This is the `verifyToken` that the <a href="#authentication">authentication middleware</a> left open:</p>
+```bash
+npm i jose
+```
+```ts title=src/tokens.ts
+import { SignJWT, jwtVerify } from 'jose';
+
+const secret = new TextEncoder().encode(config.JWT_SECRET);
+
+export function issueToken(user: { id: string; role: string }) {
+  return new SignJWT({ role: user.role })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setSubject(user.id)
+    .setIssuedAt()
+    .setExpirationTime('15m')
+    .sign(secret);
+}
+
+export async function verifyToken(token: string) {
+  try {
+    const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] });
+    return { id: payload.sub!, role: payload.role as string };
+  } catch {
+    return null;                         // bad signature, expired, or malformed
+  }
+}
+```
+<div class="tbl"><table>
+<tr><th></th><th>Session</th><th>JWT</th></tr>
+<tr><td>State lives</td><td>On the server</td><td>In the token</td></tr>
+<tr><td>Per request</td><td>One Redis lookup</td><td>A signature check, no I/O</td></tr>
+<tr><td>Revoke now</td><td>Delete the record</td><td>Not possible before `exp` without a server-side list</td></tr>
+<tr><td>Fits</td><td>Your own web app</td><td>Several services that must trust one issuer; mobile and API clients</td></tr>
+</table></div>
+<p>Because a JWT cannot be recalled, keep it short-lived (minutes). Pair it with a <b>refresh token</b>: a long-lived random value stored server-side, which the client exchanges for a new JWT and which you can revoke.</p>
+<p class="pit"><b>Common mistake</b> Verifying without pinning the algorithm, or putting private data in the payload. Always pass `algorithms`, and treat the payload as public.</p>
+<p class="more">Go deeper: <a href="https://github.com/panva/jose">jose docs</a> · <a href="https://www.rfc-editor.org/rfc/rfc7519.html">RFC 7519: JSON Web Token</a></p>
+</article>
+
+<article class="topic" id="oauth" data-k="oauth 2.0 authorization code pkce openid connect oidc sign in with google scope state access token id token">
+<h3>OAuth 2.0</h3>
+<p class="lede">OAuth 2.0 lets a user grant your app limited access to their account on another service without giving you their password. "Sign in with Google" is built on it.</p>
+<div class="tbl"><table>
+<tr><th>Role</th><th>In "Sign in with Google"</th></tr>
+<tr><td>Resource owner</td><td>The user</td></tr>
+<tr><td>Client</td><td>Your app</td></tr>
+<tr><td>Authorization server</td><td>Google's login and consent screens</td></tr>
+<tr><td>Resource server</td><td>Google's APIs holding the user's data</td></tr>
+</table></div>
+<p>The standard flow is the <b>authorization code</b> flow with PKCE (a one-time proof that the app finishing the flow is the one that started it):</p>
+<ol class="seq">
+<li><b>App → Browser</b><span>Redirect to Google with your client id, the requested <b>scope</b>, a random `state` and a PKCE challenge.</span></li>
+<li><b>User → Google</b><span>Logs in and approves. Your app never sees the password.</span></li>
+<li><b>Google → App</b><span>Redirects back to your callback URL with a short-lived `code` and the same `state`.</span></li>
+<li><b>App → Google</b><span>Server-to-server: exchanges the code, the client secret and the PKCE verifier for tokens.</span></li>
+<li><b>App</b><span>Verifies the ID token, finds or creates the user, starts its own <a href="#sessions">session</a>.</span></li>
+</ol>
+```ts title=src/routes/auth.ts
+import { createHash, randomBytes } from 'node:crypto';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const googleKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
+const redirect_uri = `${config.APP_ORIGIN}/auth/google/callback`;
+
+auth.get('/google', (req, res) => {
+  const state = randomBytes(16).toString('base64url');
+  const verifier = randomBytes(32).toString('base64url');
+  req.session.oauth = { state, verifier };                     // remembered for the callback
+
+  const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  url.search = new URLSearchParams({
+    client_id: config.GOOGLE_CLIENT_ID, redirect_uri, response_type: 'code',
+    scope: 'openid email', state,
+    code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+    code_challenge_method: 'S256',
+  }).toString();
+  res.redirect(url.href);
+});
+
+auth.get('/google/callback', async (req, res) => {
+  const saved = req.session.oauth;
+  if (!saved || req.query.state !== saved.state) {             // not a flow we started
+    res.status(400).json({ title: 'Invalid OAuth state', status: 400 });
+    return;
+  }
+  const tokens = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code', code: String(req.query.code), redirect_uri,
+      client_id: config.GOOGLE_CLIENT_ID, client_secret: config.GOOGLE_CLIENT_SECRET,
+      code_verifier: saved.verifier,
+    }),
+  }).then((r) => r.json());
+
+  const { payload } = await jwtVerify(tokens.id_token, googleKeys, {
+    issuer: 'https://accounts.google.com', audience: config.GOOGLE_CLIENT_ID,
+  });
+  req.session.userId = await findOrCreateUser(payload.email as string);
+  res.redirect('/');
+});
+```
+<p>Strictly, OAuth is about access. The <b>ID token</b>, a <a href="#jwt">JWT</a> describing the user, comes from OpenID Connect, a layer on top. Between services with no user involved, the simpler <b>client credentials</b> grant exchanges an id and secret for a token.</p>
+<p class="pit"><b>Common mistake</b> Skipping the `state` check. An attacker can then send a victim to your callback with the attacker's own code, and the victim ends up logged in to the attacker's account.</p>
+<p class="more">Go deeper: <a href="https://oauth.net/2/">oauth.net: OAuth 2.0</a> · <a href="https://developers.google.com/identity/protocols/oauth2/web-server">Google: OAuth for web server apps</a></p>
+</article>
+
+<article class="topic" id="sql-injection" data-k="sqli injection parameterized query placeholder concatenation escape least privilege">
+<h3>SQL Injection</h3>
+<p class="lede">If user input is pasted into a SQL string, the user is writing part of your query. Input chosen with care changes what the query does.</p>
+```ts
+// Vulnerable: the email becomes part of the SQL text
+const email = req.body.email;                       // attacker sends:  ' OR '1'='1
+await pool.query(`SELECT id FROM users WHERE email = '${email}'`);
+
+// What Postgres receives. The condition is now always true:
+//   SELECT id FROM users WHERE email = '' OR '1'='1'
+```
+<p>With other payloads the same hole reads any table, changes data or drops it. The fix is the one this guide has used since <a href="#sql">SQL</a>: <b>parameterized queries</b>. The query text and the values travel separately, so a value is never parsed as SQL.</p>
+```ts
+await pool.query('SELECT id FROM users WHERE email = $1', [email]);   // safe for any input
+```
+<ul>
+<li><b>Identifiers cannot be parameters.</b> Column and table names from input go through an allow-list, as in <a href="#filtering-sorting">Filtering &amp; Sorting</a>.</li>
+<li><b>Limit the blast radius.</b> The app's database user should not own the schema or be a superuser.</li>
+<li><b>ORMs and query builders</b> parameterize for you, until you use their raw-SQL escape hatch with a template string.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> "Sanitizing" input by stripping quotes or keywords. Filters get bypassed, and they corrupt honest data such as the name O'Brien. Parameters make the content of the value irrelevant.</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html">OWASP SQL Injection Prevention Cheat Sheet</a></p>
+</article>
+
+<article class="topic" id="xss" data-k="cross-site scripting script injection escape encode content security policy csp helmet innerHTML stored reflected">
+<h3>XSS</h3>
+<p class="lede">Cross-site scripting is injection aimed at the browser. If your site shows attacker-supplied text as HTML, a `<script>` in it runs in other users' browsers with their login.</p>
+<p>The script can do anything the user can: read the page, call your API with their cookies, change what they see.</p>
+<div class="tbl"><table>
+<tr><th>Kind</th><th>How the script arrives</th></tr>
+<tr><td>Stored</td><td>Saved in your database (a review, a profile name) and served to everyone who views it</td></tr>
+<tr><td>Reflected</td><td>Sent in a link and echoed straight back in the response</td></tr>
+<tr><td>DOM-based</td><td>Front-end code writes untrusted data into the page, for example with `innerHTML`</td></tr>
+</table></div>
+```ts
+// Vulnerable: reflected XSS. Try /search?q=<script>alert(1)</script>
+app.get('/search', (req, res) => {
+  res.send(`<h1>Results for ${req.query.q}</h1>`);
+});
+```
+<p>The defence is <b>output encoding</b>: when text goes into HTML, turn its special characters into harmless entities (`<` becomes `&lt;`). Template engines and front-end frameworks do this by default; the holes are the places you bypass them.</p>
+<p>A JSON API helps by never building HTML. Two more layers limit the damage when something slips through:</p>
+```bash
+npm i helmet
+```
+```ts title=src/app.ts
+import helmet from 'helmet';
+
+app.use(helmet());
+// Among other headers:
+//   Content-Security-Policy: tells the browser to run scripts only from your own origin
+//   X-Content-Type-Options: nosniff   (do not guess that a JSON response is HTML)
+```
+<p>The other layer is the `HttpOnly` flag on <a href="#sessions">session cookies</a>, which keeps the session id out of a script's reach.</p>
+<p class="pit"><b>Common mistake</b> Treating input validation as the fix, by rejecting text that contains `<script`. There are countless ways to write a script. Store the text as typed and encode it for the context where it is displayed.</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html">OWASP XSS Prevention Cheat Sheet</a> · <a href="https://helmetjs.github.io/">Helmet</a></p>
+</article>
+
+<article class="topic" id="csrf" data-k="cross-site request forgery samesite sec-fetch-site origin csrf token cookie forged">
+<h3>CSRF</h3>
+<p class="lede">Browsers attach your site's cookies to every request to your site, including requests started by a different site. Cross-site request forgery abuses that: a page the victim visits quietly submits a request to your API, and it arrives with the victim's session.</p>
+<ol class="seq">
+<li><b>Victim</b><span>Is logged in to `shop.com`. The session cookie sits in the browser.</span></li>
+<li><b>Victim</b><span>Opens `evil.example`, which holds a hidden form posting to `shop.com/v1/orders`.</span></li>
+<li><b>Browser</b><span>Sends the POST with the `shop.com` cookie attached.</span></li>
+<li><b>Shop API</b><span>Sees a valid session and places the order.</span></li>
+</ol>
+<p>It needs two things: cookie-based login and an endpoint that changes state. An API that only accepts `Authorization: Bearer` tokens is not exposed, because the browser does not attach those by itself.</p>
+<p>Two defences together cover it. First, the `SameSite=Lax` flag from <a href="#sessions">Sessions</a>, which stops the cookie being sent on cross-site POSTs. Second, check where each state-changing request came from. Browsers report that in the `Sec-Fetch-Site` header, which page scripts cannot forge:</p>
+```ts title=src/middleware/csrf.ts
+import type { RequestHandler } from 'express';
+
+const SAFE = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export const rejectCrossSite: RequestHandler = (req, res, next) => {
+  if (SAFE.has(req.method)) return next();
+
+  const site = req.get('sec-fetch-site');             // same-origin | same-site | cross-site | none
+  const origin = req.get('origin');
+  const allowed = site
+    ? site === 'same-origin' || site === 'none'
+    : !origin || origin === config.APP_ORIGIN;        // older browsers: fall back to Origin
+
+  if (allowed) return next();
+  res.status(403).json({ title: 'Cross-site request blocked', status: 403 });
+};
+```
+<p>The older technique is a <b>CSRF token</b>: a secret value the server puts in each form and checks on submit, which the attacker's page cannot know. It still works and many frameworks include it.</p>
+<p class="pit"><b>Common mistake</b> State-changing GET routes. `SameSite=Lax` still sends cookies when a user follows a link, and the check above skips GET. Keep GET <a href="#http-methods">safe</a> and both defences hold.</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html">OWASP CSRF Prevention Cheat Sheet</a> · <a href="https://developer.mozilla.org/en-US/docs/Web/Security/Attacks/CSRF">MDN: CSRF</a></p>
+</article>
+
+<article class="topic" id="rate-limiting" data-k="rate limit 429 too many requests throttle brute force express-rate-limit token bucket sliding window retry-after">
+<h3>Rate Limiting</h3>
+<p class="lede">Without a limit, one client can try a million passwords, scrape your catalogue, or simply crowd everyone else out. Rate limiting caps how many requests a client may make in a period and answers the rest with `429 Too Many Requests`.</p>
+<div class="tbl"><table>
+<tr><th>Algorithm</th><th>Rule</th><th>Behaviour</th></tr>
+<tr><td>Fixed window</td><td>N requests per clock minute</td><td>Simple. Allows a double burst across a window boundary.</td></tr>
+<tr><td>Sliding window</td><td>N requests in the last 60 seconds</td><td>Smooth. Slightly more to track.</td></tr>
+<tr><td>Token bucket</td><td>Tokens refill at a steady rate; each request spends one</td><td>Allows short bursts, enforces the average</td></tr>
+</table></div>
+<p>Two decisions matter more than the algorithm. <b>What identifies a client</b>: the IP for anonymous traffic, the user or API key once logged in. And <b>where the counters live</b>: with several instances they must be shared, so they go in Redis.</p>
+```bash
+npm i express-rate-limit rate-limit-redis
+```
+```ts title=src/middleware/limits.ts
+import { rateLimit } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import { redis } from '../redis.ts';
+
+const store = (prefix: string) =>
+  new RedisStore({ prefix, sendCommand: (...args: string[]) => redis.sendCommand(args) });
+
+export const apiLimit = rateLimit({
+  windowMs: 60_000,
+  limit: 300,                           // per client, per minute
+  standardHeaders: 'draft-8',           // tell clients their remaining quota
+  legacyHeaders: false,
+  store: store('rl:api:'),
+});
+
+export const loginLimit = rateLimit({   // far stricter where guessing pays off
+  windowMs: 15 * 60_000,
+  limit: 10,
+  store: store('rl:login:'),
+});
+```
+```ts title=src/app.ts
+app.use('/v1', apiLimit);
+app.use('/auth/login', loginLimit);
+```
+<p>The default client key is `req.ip`, so `trust proxy` must be set correctly (see <a href="#ip-addresses">IP Addresses</a>) or every user appears to share the proxy's address.</p>
+<p class="pit"><b>Common mistake</b> Limiting login by IP only. An attacker spreads guesses across many addresses. Also count failed attempts per account, and slow down or lock that account.</p>
+<p class="more">Go deeper: <a href="https://express-rate-limit.mintlify.app/overview">express-rate-limit docs</a></p>
+</article>
+
+<article class="topic" id="secrets-management" data-k="secrets api keys credentials vault secrets manager rotation least privilege leak gitignore">
+<h3>Secrets Management</h3>
+<p class="lede">Secrets are the values that grant access: database passwords, API keys, signing keys. Managing them means controlling where they live, who can read them, and how fast you can replace one that leaks.</p>
+<div class="tbl"><table>
+<tr><th>Where</th><th>Use for</th><th>Weakness</th></tr>
+<tr><td>Source code</td><td>Never</td><td>Everyone with repository access has it, forever</td></tr>
+<tr><td>`.env` file</td><td>Local development</td><td>Plain text on disk; easy to commit by accident</td></tr>
+<tr><td>Platform environment variables</td><td>Small deployments</td><td>No audit trail, manual rotation</td></tr>
+<tr><td>Secrets manager</td><td>Production</td><td>One more service to depend on</td></tr>
+</table></div>
+<p>A secrets manager (AWS Secrets Manager, Google Secret Manager, HashiCorp Vault) stores secrets encrypted, decides per service which ones it may read, logs every read, and can rotate them on a schedule. The app fetches what it needs at startup:</p>
+```ts title=src/secrets.ts
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+
+const client = new SecretsManagerClient({});   // authenticates as the server's own identity: no key in config
+
+export async function loadSecret<T>(id: string): Promise<T> {
+  const { SecretString } = await client.send(new GetSecretValueCommand({ SecretId: id }));
+  return JSON.parse(SecretString!);
+}
+
+const db = await loadSecret<{ username: string; password: string }>('prod/orders-api/postgres');
+```
+<h4>Rules that hold everywhere</h4>
+<ul>
+<li><b>Least privilege.</b> Each service gets its own credentials with only the access it needs.</li>
+<li><b>Separate per environment.</b> A leaked staging key must not open production.</li>
+<li><b>Keep them out of logs.</b> Never log whole config objects or request headers.</li>
+<li><b>Be able to rotate.</b> If replacing a secret needs a code change, you will put it off when it matters.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> Deleting a leaked secret from the repository and calling it fixed. It is still in git history and in every clone. The only fix is to rotate it: issue a new one and revoke the old.</p>
+<p class="more">Go deeper: <a href="https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html">OWASP Secrets Management Cheat Sheet</a></p>
+</article>
+</section>

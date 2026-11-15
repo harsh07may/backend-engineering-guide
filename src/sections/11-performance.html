@@ -1,0 +1,245 @@
+<section class="cat" id="performance" data-title="Performance">
+<header class="cat-head">
+  <p class="eyebrow">11 · Scale</p>
+  <h2>Performance</h2>
+  <p class="sum">Performance work is measurement first. Define what fast means, find where the time or memory actually goes, change one thing, measure again.</p>
+</header>
+
+<article class="topic" id="latency" data-k="response time percentile p50 p95 p99 tail latency average histogram">
+<h3>Latency</h3>
+<p class="lede">Latency is how long one operation takes, usually the time from request to response. It is what users feel.</p>
+<p>Latency is a distribution, so one number hides the story. Use <b>percentiles</b>: p50 is the typical request, p95 and p99 are the slow tail.</p>
+<div class="tbl"><table>
+<tr><th>Metric</th><th>Meaning</th><th>Example</th></tr>
+<tr><td>p50 (median)</td><td>Half of requests are faster</td><td class="num">40 ms</td></tr>
+<tr><td>p95</td><td>1 in 20 is slower than this</td><td class="num">180 ms</td></tr>
+<tr><td>p99</td><td>1 in 100 is slower than this</td><td class="num">900 ms</td></tr>
+<tr><td>Average</td><td>Blends both ends into a number nobody experienced</td><td class="num">75 ms</td></tr>
+</table></div>
+<p>The tail matters more than it looks. A page that makes 20 API calls will hit a p95-or-worse response on most loads, and your heaviest users make the most requests.</p>
+```ts title=src/middleware/latency.ts
+import { createHistogram } from 'node:perf_hooks';
+import type { RequestHandler } from 'express';
+
+export const latency = createHistogram();
+
+export const measure: RequestHandler = (_req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => latency.record(Number(process.hrtime.bigint() - start)));   // nanoseconds
+  next();
+};
+
+// latency.percentile(50) / 1e6  -> p50 in ms
+// latency.percentile(99) / 1e6  -> p99 in ms
+```
+<p>Where the time usually goes, and the lever for each:</p>
+<div class="tbl"><table>
+<tr><th>Time spent</th><th>Lever</th></tr>
+<tr><td>Network round trips</td><td>Fewer calls, <a href="#tcp-udp">connection reuse</a>, servers nearer the user</td></tr>
+<tr><td>Waiting on I/O in sequence</td><td>Run independent calls <a href="#io">in parallel</a></td></tr>
+<tr><td>Repeated work</td><td><a href="#caching">Caching</a></td></tr>
+<tr><td>Slow queries</td><td><a href="#query-optimization">Query optimization</a></td></tr>
+<tr><td>Work the user need not wait for</td><td>A <a href="#message-queues">queue</a></td></tr>
+</table></div>
+<p class="pit"><b>Common mistake</b> Reporting and alerting on the average. It stays calm while one user in a hundred waits ten seconds. Set targets on p95 or p99.</p>
+<p class="more">Go deeper: <a href="https://sre.google/sre-book/monitoring-distributed-systems/#latency">Google SRE book: the four golden signals</a></p>
+</article>
+
+<article class="topic" id="throughput" data-k="requests per second rps capacity saturation concurrency queueing load shedding autocannon batching">
+<h3>Throughput</h3>
+<p class="lede">Throughput is how much work the system completes per unit of time, such as requests per second. Latency is one request's experience; throughput is the system's capacity.</p>
+<p>The two are linked through concurrency, the number of requests in progress at once:</p>
+```text
+concurrency = throughput × latency
+
+200 requests/s × 0.05 s each  = 10 requests in flight
+200 requests/s × 0.50 s each  = 100 in flight   (same traffic, ten times the pressure)
+```
+<p>Every system has a capacity. Below it, latency stays flat as traffic grows. At it, new requests queue, latency climbs steeply and throughput stops rising. Past it, queues grow without bound and throughput can fall as the system spends its effort on requests that will time out anyway.</p>
+<div class="flow">
+<span>Light load<b>latency flat</b></span><i>→</i><span>Near capacity<b>latency rising</b></span><i>→</i><span class="hot">Saturated<b>queues grow, timeouts</b></span>
+</div>
+<p>Ways to raise throughput: make each request cheaper, add instances (<a href="#horizontal-scaling">horizontal scaling</a>), or <b>batch</b>, handling many items per round trip. Batching trades a little latency per item for much higher throughput.</p>
+<p>A quick local measurement, before the fuller treatment in <a href="#load-testing">Load Testing</a>:</p>
+```bash
+npx autocannon --connections 50 --duration 20 http://localhost:3000/v1/products/7
+# reports requests/sec and latency percentiles at 50 concurrent connections
+```
+<p>When load exceeds capacity, protect the system by refusing work early. A fast `503` or `429` is better for everyone than a slow timeout (see <a href="#rate-limiting">Rate Limiting</a>).</p>
+<p class="pit"><b>Common mistake</b> Quoting throughput without the latency it came with. "5,000 requests per second" at a p99 of eight seconds is a system that has already fallen over. State both: throughput at an acceptable latency.</p>
+<p class="more">Go deeper: <a href="https://github.com/mcollina/autocannon">autocannon</a></p>
+</article>
+
+<article class="topic" id="profiling" data-k="profiler cpu profile flame graph cpu-prof inspect devtools hot path heap-prof sampling">
+<h3>Profiling</h3>
+<p class="lede">Profiling records where a running program spends its time or memory. It replaces guessing: the slow part is rarely where you expect.</p>
+<p>A <b>CPU profile</b> samples the call stack many times per second. Functions that appear in many samples are where the time goes. Node has a profiler built in:</p>
+```bash
+node --cpu-prof --cpu-prof-dir=./profiles src/server.ts
+# put the server under load, then stop it with Ctrl+C
+# a .cpuprofile file appears in ./profiles
+```
+<p>Open the file in Chrome DevTools (Performance panel, Load profile) or in VS Code. It renders as a <b>flame graph</b>:</p>
+<ul>
+<li>Each box is a function. Its <b>width</b> is the share of time spent in it and everything it called.</li>
+<li>Boxes stacked on top are the functions it called.</li>
+<li>Look for wide boxes near the top of a stack: that is code doing the work itself, not waiting on a callee.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>Question</th><th>Tool</th></tr>
+<tr><td>Which function burns CPU?</td><td>`node --cpu-prof`</td></tr>
+<tr><td>What is allocating memory?</td><td>`node --heap-prof`</td></tr>
+<tr><td>What is holding memory?</td><td>Heap snapshot (see <a href="#memory-leaks">Memory Leaks</a>)</td></tr>
+<tr><td>Is the main thread blocked?</td><td><a href="#cpu-memory">Event loop lag</a></td></tr>
+<tr><td>Inspect a live process</td><td>`node --inspect`, then attach DevTools</td></tr>
+</table></div>
+<p>A CPU profile only shows time spent computing. Time spent waiting on a query does not appear, so for I/O-bound slowness measure the stages instead, as in <a href="#bottlenecks">Bottleneck Identification</a>.</p>
+<p class="pit"><b>Common mistake</b> Profiling an idle server, or on a laptop with toy data. The profile then shows startup code. Profile under realistic load with realistic data, or sample briefly in production.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/en/learn/getting-started/profiling">Node.js: profiling</a></p>
+</article>
+
+<article class="topic" id="connection-pooling" data-k="pool max connections pgbouncer idle timeout waitingCount exhaustion leak keep-alive max_connections">
+<h3>Connection Pooling</h3>
+<p class="lede">Opening a database connection costs a <a href="#tcp-udp">TCP handshake</a>, a <a href="#tls">TLS handshake</a> and a login, and Postgres starts a whole process for it. A pool keeps a few connections open and lends them out, so a query pays none of that.</p>
+<p>The pool was created back in <a href="#sql">SQL</a>. These are the settings that matter under load:</p>
+```ts title=src/db.ts
+export const pool = new Pool({
+  connectionString: config.DATABASE_URL,
+  max: 10,                          // connections this instance may open
+  idleTimeoutMillis: 30_000,        // close connections unused for 30 s
+  connectionTimeoutMillis: 2_000,   // fail fast if none is free within 2 s
+  statement_timeout: 5_000,         // Postgres cancels any query running longer than 5 s
+});
+
+// pool.totalCount, pool.idleCount, pool.waitingCount
+// waitingCount above 0 means requests are queuing for a connection
+```
+<p><b>Sizing is a budget.</b> Postgres accepts a fixed number of connections (100 by default), shared by everything that connects:</p>
+```text
+instances × max  <  max_connections, with headroom for migrations and admin tools
+8 instances × 10 = 80   fits
+20 instances × 10 = 200 does not: new connections are refused
+```
+<p>A bigger pool is not faster. Past a few connections per database core, queries only compete with each other. When instances outgrow the budget, put a pooler such as <b>PgBouncer</b> between them and Postgres. It lets thousands of client connections share a small number of real ones.</p>
+<p>The same idea applies to outbound HTTP. Node's `fetch` keeps connections to each host alive and reuses them without configuration.</p>
+<p class="pit"><b>Common mistake</b> A leaked client: `pool.connect()` on a path that never reaches `release()`. Each leak removes one connection for good. When the last one is gone, every request waits and then times out, while the database looks idle. Keep `release()` in a `finally`, as <a href="#transactions">withTransaction</a> does.</p>
+<p class="more">Go deeper: <a href="https://node-postgres.com/apis/pool">node-postgres: Pool</a> · <a href="https://www.pgbouncer.org/">PgBouncer</a></p>
+</article>
+
+<article class="topic" id="caching-strategies" data-k="cache-aside write-through write-behind read-through stampede thundering herd single flight jitter eviction lru invalidation negative caching">
+<h3>Caching Strategies</h3>
+<p class="lede"><a href="#caching">Caching</a> introduced cache-aside with a TTL. A strategy answers three further questions: what deserves caching, how the cache stays in step with writes, and what happens when an entry expires under load.</p>
+<h4>What to cache</h4>
+<p>Data that is read far more than written, expensive to produce, and tolerable when slightly stale. A product page qualifies. A stock check at checkout does not.</p>
+<h4>How writes reach the cache</h4>
+<div class="tbl"><table>
+<tr><th>Pattern</th><th>On a write</th><th>Trade-off</th></tr>
+<tr><td>Cache-aside</td><td>Update the database, delete the cache key</td><td>Simple. The next read is a miss.</td></tr>
+<tr><td>Write-through</td><td>Update the database and the cache together</td><td>Reads stay warm. Every write pays for the cache too.</td></tr>
+<tr><td>Write-behind</td><td>Update the cache now, the database later in batches</td><td>Very fast writes. A crash loses what was not yet flushed.</td></tr>
+</table></div>
+<h4>The stampede</h4>
+<p>When a popular key expires, every request in that instant misses and runs the same slow query at once. Two cheap defences: let only one caller per key do the work, and add randomness to TTLs so keys do not all expire together.</p>
+```ts title=src/cache.ts
+import { redis } from './redis.ts';
+
+const inFlight = new Map<string, Promise<unknown>>();
+
+export async function cached<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);
+
+  let pending = inFlight.get(key) as Promise<T> | undefined;
+  if (!pending) {                                          // first miss does the work
+    pending = load()
+      .then(async (value) => {
+        const jitter = Math.floor(Math.random() * ttlSeconds * 0.1);
+        await redis.setEx(key, ttlSeconds + jitter, JSON.stringify(value ?? null));
+        return value;
+      })
+      .finally(() => inFlight.delete(key));
+    inFlight.set(key, pending);
+  }
+  return pending;                                          // later misses share its result
+}
+
+// const product = await cached(`product:${id}`, 300, () => loadProduct(id));
+```
+<p>Storing `null` for a missing row is <b>negative caching</b>. Without it, requests for ids that do not exist reach the database every time. The in-flight map is bounded by design: each entry is removed when its load settles.</p>
+<h4>When the cache is full</h4>
+<p>Redis needs a memory limit and an <b>eviction policy</b>. `allkeys-lru` removes the least recently used keys first, which suits a cache.</p>
+<p class="pit"><b>Common mistake</b> Caching to cover a slow query. The first request after each expiry is still slow, and the slow query now hides until the cache is cold. Fix the query, then cache what is still expensive.</p>
+<p class="more">Go deeper: <a href="https://redis.io/docs/latest/develop/reference/eviction/">Redis: key eviction</a> · <a href="https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html">AWS: caching patterns</a></p>
+</article>
+
+<article class="topic" id="database-optimization" data-k="batch insert unnest round trips statement timeout vacuum autovacuum bloat summary table materialized view access patterns">
+<h3>Database Optimization</h3>
+<p class="lede"><a href="#query-optimization">Query Optimization</a> tuned one query with `EXPLAIN` and <a href="#indexes">indexes</a>. This topic is about the pattern of access: how many queries you send, how much each returns, and how the database is kept healthy.</p>
+<h4>Fewer round trips</h4>
+<p>Each query costs a network round trip however small it is. A hundred single-row inserts are a hundred round trips. Send one statement:</p>
+```ts
+// One INSERT for the whole cart: three arrays in, one row per element
+await tx.query(
+  `INSERT INTO order_items (order_id, product_id, quantity, unit_price_cents)
+   SELECT $1, * FROM unnest($2::bigint[], $3::int[], $4::int[])`,
+  [orderId, items.map((i) => i.productId), items.map((i) => i.quantity), items.map((i) => i.priceCents)],
+);
+```
+<p>On the read side the same idea is the <a href="#joins">N+1 fix</a>: one query with `ANY($1)` in place of a loop.</p>
+<h4>Less data per query</h4>
+<ul>
+<li>Name the columns you need. `SELECT *` drags wide columns across the network and blocks index-only plans.</li>
+<li>Always bound results, with <a href="#pagination">keyset pagination</a> for lists.</li>
+<li>Precompute heavy aggregates. A dashboard that sums a year of orders on every load should read a small summary table that a background job refreshes.</li>
+</ul>
+<h4>Protect the database from your own queries</h4>
+<ul>
+<li>Set a `statement_timeout`, as in <a href="#connection-pooling">Connection Pooling</a>, so one runaway query cannot hold a connection for minutes.</li>
+<li>Keep <a href="#transactions">transactions</a> short. Long ones hold locks and stop Postgres cleaning up old row versions.</li>
+<li>Send reads that tolerate staleness to a <a href="#replication">replica</a>.</li>
+</ul>
+<h4>Maintenance</h4>
+<p>An `UPDATE` or `DELETE` in Postgres leaves the old row version behind. <b>Autovacuum</b> reclaims that space and refreshes the statistics the planner uses. On tables with heavy churn, check that it keeps up; a table full of dead rows (bloat) makes every scan slower.</p>
+<p class="pit"><b>Common mistake</b> Adding an index for every slow query. Each one slows every write to that table, and unused ones cost for nothing. Check `pg_stat_user_indexes` for indexes with zero scans and drop them.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL: routine vacuuming</a> · <a href="https://www.postgresql.org/docs/current/performance-tips.html">performance tips</a></p>
+</article>
+
+<article class="topic" id="memory-leaks" data-k="leak heap snapshot garbage collection gc unbounded map listener closure oom heapUsed writeHeapSnapshot">
+<h3>Memory Leaks</h3>
+<p class="lede">JavaScript frees memory automatically: the garbage collector removes objects nothing refers to any more. A leak is memory you no longer need but still reference by accident, so the collector must keep it.</p>
+<p>The signature is heap usage that rises across hours and never comes back down, ending in an out-of-memory restart. Watch `heapUsed` from <a href="#cpu-memory">CPU &amp; Memory</a>: a healthy process goes up and down around a level; a leaking one climbs.</p>
+<div class="tbl"><table>
+<tr><th>Usual cause in Node</th><th>Why it leaks</th><th>Fix</th></tr>
+<tr><td>A `Map` or object used as a cache</td><td>Entries are added and never removed</td><td>Bound it by size or TTL, or use Redis</td></tr>
+<tr><td>Event listeners added per request</td><td>The emitter keeps every listener, and whatever each one captured</td><td>Remove the listener, or use `once`</td></tr>
+<tr><td>Timers never cleared</td><td>`setInterval` keeps its callback and everything it references</td><td>`clearInterval` when done</td></tr>
+<tr><td>Arrays that only grow</td><td>A module-level log or history list</td><td>Cap the length, or write it elsewhere</td></tr>
+</table></div>
+```ts
+// Leak: one entry per user id, forever
+const profiles = new Map<string, Profile>();
+
+app.get('/v1/users/:id', async (req, res) => {
+  if (!profiles.has(req.params.id)) profiles.set(req.params.id, await loadProfile(req.params.id));
+  res.json(profiles.get(req.params.id));
+});
+
+// Leak: a new listener on a shared emitter for every request
+app.get('/v1/prices', (req, res) => {
+  priceFeed.on('update', (price) => res.write(JSON.stringify(price)));
+  // fix: const onUpdate = …; priceFeed.on('update', onUpdate);
+  //      res.on('close', () => priceFeed.off('update', onUpdate));
+});
+```
+<p>To find one, compare the heap at two points in time:</p>
+```ts
+import { writeHeapSnapshot } from 'node:v8';
+
+process.on('SIGUSR2', () => console.log('heap snapshot:', writeHeapSnapshot()));
+// kill -USR2 <pid> now, again an hour later, then load both files in Chrome DevTools (Memory panel)
+```
+<p>In the comparison view, sort by what grew. The object type that keeps increasing, and the chain of references keeping it alive, point at the leak.</p>
+<p class="pit"><b>Common mistake</b> Raising the memory limit or scheduling nightly restarts. Both buy time while the leak keeps growing with traffic. Treat a steadily rising heap as a bug with a specific cause.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/en/learn/diagnostics/memory/using-heap-snapshot">Node.js: using heap snapshots</a></p>
+</article>
+</section>

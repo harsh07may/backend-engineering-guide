@@ -1,0 +1,272 @@
+<section class="cat" id="testing" data-title="Testing">
+<header class="cat-head">
+  <p class="eyebrow">12 · Shipping</p>
+  <h2>Testing</h2>
+  <p class="sum">Tests are how you change code without fear. Each kind answers a different question, from "is this function right?" to "does the system survive losing a server?", at a different cost.</p>
+</header>
+
+<article class="topic" id="unit-testing" data-k="unit test node:test assert describe it pure function fast pyramid arrange act assert">
+<h3>Unit Testing</h3>
+<p class="lede">A unit test checks one small piece of logic in isolation: give a function inputs, assert on its output. No network, no database, so thousands run in seconds.</p>
+<p>Node has a test runner built in, and it runs `.ts` files the same way Node does. No extra dependency:</p>
+```ts title=src/pricing.ts
+export type Line = { unitPriceCents: number; quantity: number };
+
+export function cartTotal(lines: Line[], discountPercent = 0): number {
+  if (discountPercent < 0 || discountPercent > 100) throw new RangeError('discount must be 0 to 100');
+  const subtotal = lines.reduce((sum, l) => sum + l.unitPriceCents * l.quantity, 0);
+  return Math.round(subtotal * (1 - discountPercent / 100));
+}
+```
+```ts title=src/pricing.test.ts
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+import { cartTotal } from './pricing.ts';
+
+describe('cartTotal', () => {
+  it('sums price times quantity', () => {
+    assert.equal(cartTotal([{ unitPriceCents: 500, quantity: 2 }, { unitPriceCents: 250, quantity: 1 }]), 1250);
+  });
+
+  it('rounds a discount to whole cents', () => {
+    assert.equal(cartTotal([{ unitPriceCents: 999, quantity: 1 }], 10), 899);
+  });
+
+  it('rejects a discount above 100', () => {
+    assert.throws(() => cartTotal([], 150), RangeError);
+  });
+});
+```
+```bash
+node --test            # finds *.test.ts files and runs them
+node --test --watch    # re-run on change
+```
+<p>Unit tests pay off most on logic with many cases: pricing, validation, parsing, state transitions. To make code testable this way, keep the logic in plain functions and the I/O at the edges.</p>
+<div class="tbl"><table>
+<tr><th>Kind</th><th>Checks</th><th>Speed</th><th>How many</th></tr>
+<tr><td>Unit</td><td>One function's logic</td><td>Milliseconds</td><td>Many</td></tr>
+<tr><td><a href="#integration-testing">Integration</a></td><td>Your code with a real database or queue</td><td>Seconds</td><td>Some</td></tr>
+<tr><td><a href="#e2e-testing">End-to-end</a></td><td>The deployed system, from outside</td><td>Minutes</td><td>Few</td></tr>
+</table></div>
+<p class="pit"><b>Common mistake</b> Asserting on how the code works instead of what it returns, such as "calls `reduce` once". Any refactor then breaks the test while behaviour is unchanged. Test inputs and outputs.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/test.html">Node.js test runner</a></p>
+</article>
+
+<article class="topic" id="mocking" data-k="mock stub spy fake dependency injection t.mock fetch timers test double">
+<h3>Mocking</h3>
+<p class="lede">Some code depends on things a test should not touch: a payment provider, the clock, an email server. A mock is a stand-in you control, so the test decides what the dependency does and can check how it was used.</p>
+<div class="tbl"><table>
+<tr><th>Stand-in</th><th>Does</th><th>Use to</th></tr>
+<tr><td>Stub</td><td>Returns a fixed answer</td><td>Drive the code down a path: "the API returns 503"</td></tr>
+<tr><td>Spy</td><td>Records how it was called</td><td>Check an effect: "the email was sent once"</td></tr>
+<tr><td>Fake</td><td>A simple working version, such as an in-memory store</td><td>Replace something slow with something real enough</td></tr>
+</table></div>
+<p>The runner's mocks cover all three. Here, a function that fails twice then succeeds tests the <a href="#retries">retry helper</a>:</p>
+```ts title=src/retry.test.ts
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { retry } from './retry.ts';
+
+test('retry keeps trying until the work succeeds', async (t) => {
+  let calls = 0;
+  const work = t.mock.fn(async () => {
+    if (++calls < 3) throw new Error('temporary');
+    return 'ok';
+  });
+
+  const result = await retry(work, () => true, 4, 0);   // 0 ms base delay keeps the test fast
+
+  assert.equal(result, 'ok');
+  assert.equal(work.mock.callCount(), 3);
+});
+```
+<p>To replace something global, mock the method. Mocks made through `t.mock` are undone when the test ends:</p>
+```ts
+test('recommendations fall back to an empty list when the service is down', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('connect ECONNREFUSED'); });
+
+  assert.deepEqual(await getRecommendations('42'), []);
+});
+```
+<p>Mocking is easiest when dependencies are passed in. A function that receives `sendEmail` as a parameter can be handed a spy; one that imports it directly needs module-level tricks.</p>
+<p class="pit"><b>Common mistake</b> Mocking so much that the test only checks the mocks. If the database is mocked, a test of `placeOrder` proves nothing about the SQL. Mock what you do not own or cannot control (third-party APIs, time), and use the real thing for what you own.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/test.html#mocking">Node.js test runner: mocking</a></p>
+</article>
+
+<article class="topic" id="integration-testing" data-k="integration test supertest testcontainers real database postgres container http route">
+<h3>Integration Testing</h3>
+<p class="lede">An integration test checks that your code works with the real things it talks to. For this API that means an HTTP request going through routing, validation, the handler and a real Postgres.</p>
+<p>It catches what unit tests cannot: a typo in SQL, a constraint you forgot, middleware in the wrong order. Two libraries make it practical. <b>Testcontainers</b> starts a throwaway Postgres in Docker for the test run. <b>Supertest</b> sends requests to the Express app without opening a port, which is why <a href="#project-setup">app.ts</a> is separate from server.ts.</p>
+```bash
+npm i -D supertest @types/supertest @testcontainers/postgresql
+```
+```ts title=test/orders.test.ts
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { after, before, beforeEach, test } from 'node:test';
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import request from 'supertest';
+
+const container = await new PostgreSqlContainer('postgres:18').start();
+process.env.DATABASE_URL = container.getConnectionUri();     // set before the app reads its config
+
+const { app } = await import('../src/app.ts');
+const { pool } = await import('../src/db.ts');
+const { issueToken } = await import('../src/tokens.ts');
+
+before(async () => {
+  await pool.query(await readFile('schema.sql', 'utf8'));
+});
+beforeEach(async () => {                                      // every test starts from the same data
+  await pool.query('TRUNCATE users, products, orders, order_items RESTART IDENTITY CASCADE');
+  await pool.query(`INSERT INTO users (email) VALUES ('a@shop.test')`);
+  await pool.query(`INSERT INTO products (name, price_cents, stock) VALUES ('Coffee', 500, 3)`);
+});
+after(async () => {
+  await pool.end();
+  await container.stop();
+});
+
+test('placing an order returns 201 and reduces stock', async () => {
+  const token = await issueToken({ id: '1', role: 'customer' });
+
+  const res = await request(app)
+    .post('/v1/orders')
+    .set('authorization', `Bearer ${token}`)
+    .set('idempotency-key', crypto.randomUUID())
+    .send({ productId: 1, quantity: 2 });
+
+  assert.equal(res.status, 201);
+  const { rows } = await pool.query('SELECT stock FROM products WHERE id = 1');
+  assert.equal(rows[0].stock, 1);
+});
+
+test('ordering more than the stock is rejected and changes nothing', async () => {
+  const token = await issueToken({ id: '1', role: 'customer' });
+
+  const res = await request(app)
+    .post('/v1/orders')
+    .set('authorization', `Bearer ${token}`)
+    .set('idempotency-key', crypto.randomUUID())
+    .send({ productId: 1, quantity: 5 });
+
+  assert.notEqual(res.status, 201);
+  const { rows } = await pool.query('SELECT count(*)::int AS n FROM orders');
+  assert.equal(rows[0].n, 0);                                 // the transaction rolled back
+});
+```
+<p>Use the same database engine and version as production. A substitute such as SQLite behaves differently exactly where bugs hide: types, constraints, locking.</p>
+<p class="pit"><b>Common mistake</b> Tests that share data. One test leaves rows behind and another passes or fails depending on run order. Reset state before each test, as `beforeEach` does here.</p>
+<p class="more">Go deeper: <a href="https://node.testcontainers.org/modules/postgresql/">Testcontainers: PostgreSQL module</a></p>
+</article>
+
+<article class="topic" id="e2e-testing" data-k="end-to-end e2e user journey staging smoke test flaky black box">
+<h3>End-to-End Testing</h3>
+<p class="lede">An end-to-end test drives the whole running system from outside, the way a user or client does, and knows nothing about its internals. It answers "does the product work?", across every service, queue and configuration file.</p>
+<p>For an API, that is a script making real HTTP calls against a deployed environment and following one complete journey:</p>
+```ts title=e2e/checkout.test.ts
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+const base = process.env.BASE_URL ?? 'http://localhost:3000';
+
+test('a customer can log in, place an order and see it in their list', async () => {
+  const login = await fetch(`${base}/auth/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'e2e@shop.test', password: process.env.E2E_PASSWORD }),
+  });
+  const { token } = await login.json();
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+
+  const created = await fetch(`${base}/v1/orders`, {
+    method: 'POST',
+    headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
+    body: JSON.stringify({ productId: 1, quantity: 1 }),
+  });
+  assert.equal(created.status, 201);
+  const order = await created.json();
+
+  const list = await fetch(`${base}/v1/orders`, { headers }).then((r) => r.json());
+  assert.ok(list.data.some((o: { id: string }) => o.id === order.id));
+});
+```
+```bash
+BASE_URL=https://staging.shop.com node --test e2e/
+```
+<p>These tests are the most realistic and the most expensive. They are slow, they need a whole environment, and they fail for reasons unrelated to your change (a flaky test). So keep them few: the handful of journeys the business cannot do without, such as sign-up, login, checkout.</p>
+<p>The same script, pointed at production right after a deploy, is a <b>smoke test</b>: a fast check that the release is alive.</p>
+<p class="pit"><b>Common mistake</b> Covering every case end to end because it "tests the real thing". The suite takes an hour, fails at random, and people stop trusting it. Push each case down to the cheapest test that can catch it.</p>
+<p class="more">Go deeper: <a href="https://martinfowler.com/articles/practical-test-pyramid.html">Martin Fowler: the practical test pyramid</a></p>
+</article>
+
+<article class="topic" id="load-testing" data-k="load test k6 stress spike soak virtual users thresholds capacity p95">
+<h3>Load Testing</h3>
+<p class="lede">Functional tests send one request at a time. A load test sends many at once to find out how the system behaves under traffic: what <a href="#throughput">throughput</a> it sustains, at what <a href="#latency">latency</a>, and what breaks first.</p>
+<div class="tbl"><table>
+<tr><th>Test</th><th>Traffic shape</th><th>Question</th></tr>
+<tr><td>Load</td><td>Expected peak, held steady</td><td>Do we meet our targets on a normal busy day?</td></tr>
+<tr><td>Stress</td><td>Increasing until failure</td><td>Where is the limit, and how does it fail?</td></tr>
+<tr><td>Spike</td><td>A sudden jump</td><td>Do we survive a flash sale?</td></tr>
+<tr><td>Soak</td><td>Moderate, for hours</td><td>Does anything <a href="#memory-leaks">leak</a> or fill up?</td></tr>
+</table></div>
+<p>k6 is a common tool. The test is a script, and each <b>virtual user</b> runs it in a loop. Thresholds turn the run into a pass or fail:</p>
+```ts title=load/browse-and-order.ts
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 100 },    // ramp up to 100 virtual users
+    { duration: '5m', target: 100 },    // hold
+    { duration: '1m', target: 0 },      // ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<300'],   // 95% of requests under 300 ms
+    http_req_failed: ['rate<0.01'],     // under 1% errors
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.BASE_URL}/v1/products/${1 + Math.floor(Math.random() * 500)}`);
+  check(res, { 'status is 200': (r) => r.status === 200 });
+  sleep(1);                             // think time between a user's actions
+}
+```
+```bash
+k6 run -e BASE_URL=https://staging.shop.com load/browse-and-order.ts
+```
+<p>While it runs, watch the server side as well as k6's numbers: CPU, event loop lag, pool wait, database load. The first resource to saturate is your <a href="#bottlenecks">bottleneck</a>.</p>
+<p class="pit"><b>Common mistake</b> An unrealistic test: an empty database, one product id requested repeatedly so everything is cached, or the load generator on the same machine as the server. Use production-sized data, a realistic mix of requests, and a separate machine.</p>
+<p class="more">Go deeper: <a href="https://grafana.com/docs/k6/latest/">k6 docs</a></p>
+</article>
+
+<article class="topic" id="failure-testing" data-k="chaos engineering fault injection game day kill resilience toxiproxy failover drill">
+<h3>Failure Testing</h3>
+<p class="lede">Timeouts, retries, fallbacks and failover are code paths that only run when something breaks. If you never break anything on purpose, their first real test is an outage. Failure testing injects faults deliberately and checks that the system responds as designed.</p>
+<p>The method, often called chaos engineering, is an experiment:</p>
+<ol>
+<li><b>State what should happen.</b> "If the recommendations service is down, product pages still load in under 300 ms."</li>
+<li><b>Inject the fault</b>, in the smallest scope that tests it.</li>
+<li><b>Observe</b> the metrics users care about.</li>
+<li><b>Fix what was wrong</b> and repeat.</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>Fault to inject</th><th>What it verifies</th></tr>
+<tr><td>Kill an API instance</td><td><a href="#load-balancing">Health checks</a> remove it; <a href="#processes">shutdown</a> drops no requests</td></tr>
+<tr><td>Kill a worker mid-job</td><td>The job is redelivered and <a href="#idempotency">handled once</a></td></tr>
+<tr><td>Add 2 s of latency to a dependency</td><td><a href="#fault-tolerance">Timeouts and fallbacks</a> hold; no cascade</td></tr>
+<tr><td>Stop Redis</td><td>The app degrades to the database and does not crash</td></tr>
+<tr><td>Fail over the database</td><td>The <a href="#dist-replication">pool reconnects</a>; how many writes were lost</td></tr>
+</table></div>
+<p>Start at the cheapest level. Many failure paths are testable in code with a <a href="#mocking">mock</a>, as the recommendations fallback test showed. The next level is the local stack:</p>
+```bash
+docker compose kill cache          # Redis disappears
+curl -i localhost:3000/v1/products/7   # should still answer, from Postgres
+docker compose start cache
+```
+<p>For network faults such as latency or dropped connections, a proxy like Toxiproxy sits between your app and a dependency and misbehaves on command. In staging or production, a planned session of such experiments is called a <b>game day</b>.</p>
+<p class="pit"><b>Common mistake</b> A failover that exists only in a diagram. Untested recovery has usually decayed: an expired credential, a replica too small to take the load, a runbook for last year's setup. Run the drill on a schedule.</p>
+<p class="more">Go deeper: <a href="https://principlesofchaos.org/">Principles of chaos engineering</a> · <a href="https://github.com/Shopify/toxiproxy">Toxiproxy</a></p>
+</article>
+</section>

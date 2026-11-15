@@ -1,0 +1,228 @@
+<section class="cat" id="os" data-title="Operating Systems">
+<header class="cat-head">
+  <p class="eyebrow">05 · Foundations</p>
+  <h2>Operating Systems</h2>
+  <p class="sum">Your service is a program the operating system runs, schedules, feeds with I/O and eventually stops. Knowing those mechanics explains most of how Node behaves under load.</p>
+</header>
+
+<article class="topic" id="processes" data-k="pid signal sigterm sigkill exit code graceful shutdown isolation">
+<h3>Processes</h3>
+<p class="lede">A process is a running instance of a program. The OS gives each one its own private memory and an id (PID), so a crash in one cannot corrupt another.</p>
+<p>Because memory is private, processes talk through the OS: sockets, pipes, files. Your API and Postgres are two processes exchanging bytes over a TCP socket.</p>
+<p>The OS also talks to processes, through <b>signals</b>:</p>
+<div class="tbl"><table>
+<tr><th>Signal</th><th>Meaning</th><th>Can you handle it?</th></tr>
+<tr><td>SIGTERM</td><td>"Please stop." Sent by deploy tools and container platforms.</td><td>Yes</td></tr>
+<tr><td>SIGINT</td><td>Ctrl+C in a terminal</td><td>Yes</td></tr>
+<tr><td>SIGKILL</td><td>Stopped immediately by the OS</td><td>No</td></tr>
+</table></div>
+<p>A deploy sends SIGTERM, waits a grace period, then sends SIGKILL. Use the grace period to finish requests already in flight:</p>
+```ts title=src/server.ts
+import { pool } from './db.ts';
+import { redis } from './redis.ts';
+
+const server = app.listen(port);
+
+function shutdown() {
+  server.close(async () => {              // stop accepting; wait for open requests
+    await pool.end();
+    await redis.close();
+    process.exit(0);                      // exit code 0 = success
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();   // stuck? give up after 10 s
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+```
+<p class="pit"><b>Common mistake</b> No SIGTERM handler. Every deploy then cuts off whatever requests were running, and users see random failures that only happen during releases.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/process.html#signal-events">Node.js: signal events</a></p>
+</article>
+
+<article class="topic" id="threads" data-k="event loop single thread worker_threads libuv thread pool blocking cpu">
+<h3>Threads</h3>
+<p class="lede">A thread is a path of execution inside a process. Threads in one process share its memory, which makes them cheap to create and fast to coordinate, and is also what makes them dangerous (see <a href="#race-conditions">Race Conditions</a>).</p>
+<p>Many servers use one thread per request. Node does not. Your JavaScript runs on a single main thread that loops over a queue of events: a request arrived, a query finished, a timer fired. This is the <b>event loop</b>.</p>
+<div class="flow">
+<span class="hot">Main thread<b>your JavaScript, one piece at a time</b></span><i>hands off →</i>
+<span>OS<b>network sockets</b></span>
+<span>Thread pool (4)<b>files, DNS, crypto, zlib</b></span>
+<span>Worker threads<b>your CPU-heavy code</b></span>
+</div>
+<p>Waiting is free: while a query is in flight, the main thread serves other requests. Computing is not: a loop that takes 2 seconds stalls every request for 2 seconds. Move such work to a <b>worker thread</b>:</p>
+```ts title=src/report-worker.ts
+import { parentPort, workerData } from 'node:worker_threads';
+
+parentPort!.postMessage(buildReport(workerData));   // heavy CPU work, off the main thread
+```
+```ts title=src/reports.ts
+import { Worker } from 'node:worker_threads';
+
+export function runReport(input: unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./report-worker.ts', import.meta.url), { workerData: input });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+  });
+}
+```
+<p class="pit"><b>Common mistake</b> Blocking the main thread without noticing: `readFileSync` in a handler, `JSON.parse` on a 50 MB body, synchronous password hashing. One slow request becomes everyone's slow request.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop">Node.js: don't block the event loop</a></p>
+</article>
+
+<article class="topic" id="cpu-memory" data-k="heap rss cores event loop lag max-old-space-size oom cluster cpu-bound io-bound">
+<h3>CPU & Memory</h3>
+<p class="lede">CPU is how much computing you can do per second. Memory (RAM) is how much you can hold at once. Running out of either looks different, and the fixes differ.</p>
+<div class="tbl"><table>
+<tr><th>Resource</th><th>When it runs out</th><th>What to watch</th></tr>
+<tr><td>CPU</td><td>Requests queue behind each other and latency climbs</td><td>Event loop lag: how late the loop runs its next task</td></tr>
+<tr><td>Memory</td><td>The process is killed (out of memory, OOM)</td><td>`rss`: total RAM the OS has given the process</td></tr>
+</table></div>
+<p>Work is <b>I/O-bound</b> when it mostly waits (queries, HTTP calls) and <b>CPU-bound</b> when it mostly computes (image resizing, hashing). Node handles thousands of I/O-bound requests on one core. CPU-bound work needs <a href="#threads">worker threads</a> or more processes.</p>
+```ts
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const lag = monitorEventLoopDelay({ resolution: 20 });
+lag.enable();
+
+setInterval(() => {
+  const { rss, heapUsed } = process.memoryUsage();
+  console.log({
+    rssMb: Math.round(rss / 1e6),
+    heapMb: Math.round(heapUsed / 1e6),             // JavaScript objects only
+    loopLagP99Ms: Math.round(lag.percentile(99) / 1e6),
+  });
+  lag.reset();
+}, 10_000).unref();
+```
+<p>One Node process uses one core for JavaScript. To use eight cores, run eight processes (see <a href="#vertical-scaling">Vertical Scaling</a>).</p>
+<p class="pit"><b>Common mistake</b> Loading everything into memory: reading a 2 GB file with `readFile`, or selecting a million rows into an array. Memory use then scales with data size and the process dies on a big day. Stream it, as the next topic shows.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/perf_hooks.html#perf_hooksmonitoreventloopdelayoptions">Node.js: monitorEventLoopDelay</a></p>
+</article>
+
+<article class="topic" id="io" data-k="input output blocking non-blocking async stream backpressure pipeline epoll latency numbers">
+<h3>I/O</h3>
+<p class="lede">I/O (input/output) is any exchange with the world outside the process's memory: disk, network, database. It dominates backend latency because it is so much slower than computing.</p>
+<div class="tbl"><table>
+<tr><th>Operation</th><th>Rough time</th><th>If a memory read took 1 second</th></tr>
+<tr><td>Read from memory</td><td class="num">100 ns</td><td>1 second</td></tr>
+<tr><td>Read from SSD</td><td class="num">100 µs</td><td>17 minutes</td></tr>
+<tr><td>Round trip in a data center</td><td class="num">0.5 ms</td><td>1.4 hours</td></tr>
+<tr><td>Round trip across an ocean</td><td class="num">150 ms</td><td>17 days</td></tr>
+</table></div>
+<p><b>Blocking</b> I/O makes the thread wait for the result. <b>Non-blocking</b> I/O starts the operation and returns at once; the OS reports back when data is ready. Node is built on the second kind, and `await` is how you write it: the function pauses, the thread moves on.</p>
+<p>For large data, do not wait for all of it. A <b>stream</b> delivers it in chunks, and <b>backpressure</b> pauses the source when the destination cannot keep up, so memory stays flat:</p>
+```ts
+import { createReadStream } from 'node:fs';
+import { basename } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+
+app.get('/v1/exports/:file', async (req, res) => {
+  res.type('text/csv');
+  // File -> response, a chunk at a time. A slow client slows the read, not the server.
+  await pipeline(createReadStream(`/var/exports/${basename(req.params.file)}`), res);
+});
+```
+<p class="pit"><b>Common mistake</b> I/O calls in sequence that could run together. Three independent 50 ms queries awaited one by one take 150 ms; `await Promise.all([a(), b(), c()])` takes 50.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/en/learn/asynchronous-work/overview-of-blocking-vs-non-blocking">Node.js: blocking vs non-blocking</a></p>
+</article>
+
+<article class="topic" id="file-systems" data-k="files directories path permissions file descriptor emfile fsync rename atomic path traversal inode">
+<h3>File Systems</h3>
+<p class="lede">A disk is one long run of bytes. The file system turns it into named files in directories, each with an owner, permissions and timestamps.</p>
+<ul>
+<li><b>Permissions</b> grant read, write and execute to the owner, a group and everyone else. Run your service as a user that can read only what it needs.</li>
+<li><b>File descriptors</b> are the numbered handles a process gets for each open file, and for each socket. The OS caps them per process. Leak them and you hit `EMFILE: too many open files`, which also stops new connections.</li>
+<li><b>Writes are buffered.</b> A successful write means the OS has the data in memory, not that it is on disk. `fsync` forces it to disk.</li>
+</ul>
+<p>A crash in the middle of a write leaves half a file. The standard fix is to write a temporary file and rename it, because a rename within one file system is atomic: readers see the old file or the new one, never a mix.</p>
+```ts
+import { rename, writeFile } from 'node:fs/promises';
+
+export async function saveAtomically(path: string, data: string) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, data, { flush: true });   // flush: fsync before closing
+  await rename(tmp, path);                       // swap in one step
+}
+```
+<p class="pit"><b>Common mistake</b> Building a path from user input. A request for `../../etc/passwd` walks out of your folder (path traversal). Reduce the input to a bare name with `basename`, as the export route above does, or resolve the full path and check it still starts with your base directory.</p>
+<p>Containers add one more rule: their disk is wiped on redeploy. Anything that must last goes to a database or <a href="#object-storage">object storage</a>.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/fs.html#promises-api">Node.js: fs promises API</a></p>
+</article>
+
+<article class="topic" id="env-vars" data-k="environment variables config process.env dotenv env-file twelve-factor validation">
+<h3>Environment Variables</h3>
+<p class="lede">The same code runs on your laptop, in staging and in production. What differs, such as the database URL or the port, is passed in from outside as environment variables: named strings the OS hands a process when it starts.</p>
+<p>Node exposes them on `process.env`. Every value is a string, and a missing one is `undefined`. Read them in one place, validate them at startup, and export typed values:</p>
+```ts title=src/config.ts
+import * as z from 'zod';
+
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().default(3000),
+  DATABASE_URL: z.url(),
+  REDIS_URL: z.url(),
+});
+
+export const config = Env.parse(process.env);   // a bad value stops the app at boot
+```
+```bash title=.env (local only)
+DATABASE_URL=postgres://shop:shop@localhost:5432/shop
+REDIS_URL=redis://localhost:6379
+```
+<p>Locally, `node --env-file=.env` loads the file. In production the platform sets the variables and there is no file.</p>
+<p class="pit"><b>Common mistake</b> Committing `.env` to git. Once a secret is in history it must be treated as leaked and rotated. Add `.env` to `.gitignore` and commit a `.env.example` with fake values. Where real secrets should live is covered in <a href="#secrets-management">Secrets Management</a>.</p>
+<p class="more">Go deeper: <a href="https://12factor.net/config">The Twelve-Factor App: config</a> · <a href="https://nodejs.org/en/learn/command-line/how-to-read-environment-variables-from-nodejs">Node.js: reading environment variables</a></p>
+</article>
+
+<article class="topic" id="locks" data-k="mutual exclusion critical section exclusive shared row lock advisory lock contention">
+<h3>Locks</h3>
+<p class="lede">When two tasks may touch the same resource at once, a lock makes them take turns. One acquires it and proceeds; the rest wait until it is released.</p>
+<p>The code that runs while holding the lock is the <b>critical section</b>. The property a lock provides is <b>mutual exclusion</b>: at most one holder at a time.</p>
+<div class="tbl"><table>
+<tr><th>Kind</th><th>Rule</th><th>Where you meet it</th></tr>
+<tr><td>Exclusive</td><td>One holder, reading or writing</td><td>A row during `UPDATE`, or after `SELECT … FOR UPDATE`</td></tr>
+<tr><td>Shared / exclusive</td><td>Many readers together, or one writer alone</td><td>Table locks during schema changes</td></tr>
+<tr><td>Advisory</td><td>A named lock with no built-in meaning; the application decides what it protects</td><td>"Only one server runs this job"</td></tr>
+</table></div>
+<p>Postgres already locks rows for you inside <a href="#transactions">transactions</a>. Advisory locks cover the cases with no row to lock. Here, several servers start the same nightly job and exactly one proceeds:</p>
+```ts
+import { withTransaction } from './db.ts';
+
+await withTransaction(async (tx) => {
+  const { rows } = await tx.query('SELECT pg_try_advisory_xact_lock(1001) AS acquired');
+  if (!rows[0].acquired) return;        // another server holds it: skip
+  await closeOutDay(tx);
+});                                     // released automatically at commit or rollback
+```
+<p>Locks cost throughput. Waiters sit idle, so hold a lock for as little time and over as little data as possible.</p>
+<p class="pit"><b>Common mistake</b> A lock that is never released because an error skipped the unlock. Tie the release to something that always happens: the end of a transaction, a `finally` block, or an expiry time.</p>
+<p>Locking in application code, across one process and across many servers, is in <a href="#mutexes">Mutexes &amp; Locks</a>.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/explicit-locking.html">PostgreSQL: explicit locking</a></p>
+</article>
+
+<article class="topic" id="deadlocks" data-k="deadlock circular wait lock ordering 40P01 lock_timeout detection">
+<h3>Deadlocks</h3>
+<p class="lede">A deadlock is two tasks each holding a lock the other needs. Neither can continue, and neither will let go.</p>
+<ol class="seq">
+<li><b>Order A</b><span>Updates product 7. Now holds the lock on row 7.</span></li>
+<li><b>Order B</b><span>Updates product 12. Now holds the lock on row 12.</span></li>
+<li><b>Order A</b><span>Updates product 12. Waits for B.</span></li>
+<li><b>Order B</b><span>Updates product 7. Waits for A. Nothing can move.</span></li>
+</ol>
+<p>Postgres detects the cycle after about a second, aborts one transaction with error `40P01`, and lets the other finish. That is recovery. Prevention is simpler: if every transaction takes its locks <b>in the same order</b>, a cycle cannot form.</p>
+```ts
+// Always lock products in ascending id order, whatever order the cart lists them in.
+const sorted = items.toSorted((a, b) => a.productId - b.productId);
+
+for (const item of sorted) {
+  await tx.query(
+    'UPDATE products SET stock = stock - $2 WHERE id = $1 AND stock >= $2',
+    [item.productId, item.quantity],
+  );
+}
+```
+<p>Two more defences: keep transactions short so locks are held briefly, and set a ceiling on waiting with `SET lock_timeout = '2s'` so a stuck request fails fast instead of piling up.</p>
+<p class="pit"><b>Common mistake</b> Treating `40P01` as a bug to swallow. It is a signal to run the whole transaction again from the start (see <a href="#retries">Retries</a>), and if it happens often, to fix the lock order.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS">PostgreSQL: deadlocks</a></p>
+</article>
+</section>

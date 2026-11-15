@@ -1,0 +1,182 @@
+<section class="cat" id="storage" data-title="Data Storage">
+<header class="cat-head">
+  <p class="eyebrow">04 · Data</p>
+  <h2>Data Storage</h2>
+  <p class="sum">Postgres is the source of truth, and it should not hold everything. This chapter adds a cache, a place for files, and a second copy of the database, and looks at what each copy does to correctness.</p>
+</header>
+
+<article class="topic" id="sql-vs-nosql" data-k="relational document key-value wide-column mongodb dynamodb cassandra jsonb schema">
+<h3>SQL vs NoSQL</h3>
+<p class="lede">"NoSQL" groups several kinds of database that drop the relational model to get something else: flexible shapes, simpler scaling across machines, or raw speed for one access pattern.</p>
+<div class="tbl"><table>
+<tr><th>Kind</th><th>Data looks like</th><th>Good at</th><th>You give up</th></tr>
+<tr><td>Relational<br>Postgres, MySQL</td><td>Tables with a fixed schema</td><td>Ad-hoc queries, joins, transactions</td><td>Spreading writes across many machines is hard</td></tr>
+<tr><td>Document<br>MongoDB</td><td>JSON-like documents</td><td>Nested data read as a whole</td><td>Joins and cross-document rules move into your code</td></tr>
+<tr><td>Key-value<br>Redis, DynamoDB</td><td>A key and a value</td><td>Very fast lookup by key</td><td>Queries by anything other than the key</td></tr>
+<tr><td>Wide-column<br>Cassandra</td><td>Rows grouped by a partition key</td><td>Huge write volume across many nodes</td><td>You design tables around known queries up front</td></tr>
+</table></div>
+<p>The real question is how you will read the data. If you know every query in advance and they are all "get by key", a key-value store is simpler and scales further. If queries will keep changing, or the data has relationships, start relational.</p>
+<p>The line has also blurred. Postgres stores and indexes JSON, which covers the "some fields vary" case without a second database:</p>
+```sql
+ALTER TABLE orders ADD COLUMN metadata jsonb NOT NULL DEFAULT '{}';
+
+SELECT id FROM orders WHERE metadata @> '{"gift": true}';   -- @> means "contains"
+```
+<p class="pit"><b>Common mistake</b> Choosing a NoSQL store "for scale" before any scale exists. You pay the costs on day one (no joins, weaker transactions) for a benefit that one Postgres server would have covered for years.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#database">System Design Primer: database</a></p>
+</article>
+
+<article class="topic" id="redis" data-k="in-memory key value ttl expire incr hash sorted set node-redis createClient valkey">
+<h3>Redis</h3>
+<p class="lede">Redis is a key-value server that keeps its data in memory, so reads and writes take well under a millisecond. It is the usual home for data that is hot, small and temporary.</p>
+<p>Values are more than strings. Each type fits a job:</p>
+<div class="tbl"><table>
+<tr><th>Type</th><th>Typical use</th></tr>
+<tr><td>String</td><td>Cached JSON, counters</td></tr>
+<tr><td>Hash</td><td>One object with fields, such as a session</td></tr>
+<tr><td>List / Stream</td><td>Queues and event logs</td></tr>
+<tr><td>Set</td><td>Unique members, such as users online</td></tr>
+<tr><td>Sorted set</td><td>Leaderboards, rate-limit windows</td></tr>
+</table></div>
+<p>Two properties make it more than a fast map. Any key can have a <b>TTL</b> and delete itself. And Redis runs commands one at a time, so each command is <b>atomic</b>: two clients calling `INCR` at once always get two different numbers.</p>
+```ts title=src/redis.ts
+import { createClient } from 'redis';
+
+export const redis = await createClient({ url: process.env.REDIS_URL })   // redis://localhost:6379
+  .on('error', (err) => console.error('redis', err))
+  .connect();
+```
+```ts
+await redis.setEx('session:abc123', 3600, JSON.stringify({ userId: '42' }));   // expires in 1 hour
+const session = await redis.get('session:abc123');                             // string, or null
+
+const views = await redis.incr('views:product:7');                             // atomic counter
+```
+<p>Name keys with a prefix and colons (`session:abc123`) so related keys are easy to find and never collide.</p>
+<p class="pit"><b>Common mistake</b> Treating Redis as the only copy of data you cannot lose. Memory is finite, and by default a crash can lose the most recent writes. Keep the truth in Postgres, and set a TTL and a memory limit with an eviction policy so Redis sheds old keys instead of refusing writes.</p>
+<p class="more">Go deeper: <a href="https://redis.io/docs/latest/develop/data-types/">Redis data types</a> · <a href="https://redis.io/docs/latest/develop/clients/nodejs/">node-redis guide</a></p>
+</article>
+
+<article class="topic" id="caching" data-k="cache-aside ttl invalidation hit miss cache-control cdn stale">
+<h3>Caching</h3>
+<p class="lede">A cache keeps the result of slow work somewhere fast, so the next request skips the work. It trades freshness for speed: a cached answer may be out of date.</p>
+<p>The standard pattern is <b>cache-aside</b>. The application checks the cache first and fills it on a miss.</p>
+<div class="flow">
+<span>Request</span><i>→</i><span class="hot">Redis</span><i>hit →</i><span>Respond</span>
+<i>&nbsp;· miss →</i><span>Postgres</span><i>→</i><span class="hot">Store with TTL</span><i>→</i><span>Respond</span>
+</div>
+```ts title=src/products.ts
+import { pool } from './db.ts';
+import { redis } from './redis.ts';
+
+export async function getProduct(id: string) {
+  const key = `product:${id}`;
+
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);                     // hit
+
+  const { rows } = await pool.query(
+    'SELECT id, name, price_cents, stock FROM products WHERE id = $1', [id],
+  );
+  if (rows[0]) await redis.setEx(key, 300, JSON.stringify(rows[0]));   // miss: fill for 5 minutes
+  return rows[0] ?? null;
+}
+
+export async function renameProduct(id: string, name: string) {
+  await pool.query('UPDATE products SET name = $2 WHERE id = $1', [id, name]);
+  await redis.del(`product:${id}`);                          // invalidate: next read refills
+}
+```
+<p>Two mechanisms keep it honest. <b>Invalidation</b> removes the entry when the data changes. The <b>TTL</b> is the backstop that bounds how stale an entry can get if an invalidation is ever missed.</p>
+<p>Redis is one layer. Browsers and CDNs (content delivery networks, servers near the user) cache whole responses when you allow it with a header:</p>
+```ts
+res.set('Cache-Control', 'public, max-age=60').json(product);   // anyone may reuse this for 60 s
+```
+<p class="pit"><b>Common mistake</b> Caching per-user data under a shared key or with `public`. One user is then served another's response. Put the user id in the key, and use `Cache-Control: private` or `no-store` for personal data.</p>
+<p>What to cache, where, and what happens when a popular key expires is covered in <a href="#caching-strategies">Caching Strategies</a>.</p>
+<p class="more">Go deeper: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching">MDN: HTTP caching</a> · <a href="https://github.com/donnemartin/system-design-primer#cache">System Design Primer: cache</a></p>
+</article>
+
+<article class="topic" id="object-storage" data-k="s3 bucket blob file upload presigned url images cdn r2 gcs minio">
+<h3>Object Storage</h3>
+<p class="lede">Files such as images, PDFs and video do not belong in database rows or on the app server's disk. Object storage holds them as <b>objects</b>, each a blob with a key, inside a <b>bucket</b>, reached over HTTP.</p>
+<p>Amazon S3 defined the model. Google Cloud Storage, Cloudflare R2 and the self-hosted MinIO work the same way, and most accept the S3 API. The database keeps only the object's key and its metadata.</p>
+<p>The best upload path skips your server. Your API issues a <b>presigned URL</b>, a short-lived link that permits exactly one operation on one key, and the client sends the file straight to storage.</p>
+<ol class="seq">
+<li><b>Client → API</b><span>"I want to upload a receipt."</span></li>
+<li><b>API → Client</b><span>A key and a presigned URL, valid for five minutes.</span></li>
+<li><b>Client → Storage</b><span>`PUT` the file to that URL. Your server never touches the bytes.</span></li>
+<li><b>Client → API</b><span>"Done." The API saves the key on the order.</span></li>
+</ol>
+```bash
+npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+```
+```ts title=src/app.ts
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+app.post('/v1/uploads', authenticate, async (_req, res) => {
+  const key = `receipts/${res.locals.user.id}/${crypto.randomUUID()}.pdf`;   // we choose the key
+  const command = new PutObjectCommand({
+    Bucket: process.env.UPLOAD_BUCKET,
+    Key: key,
+    ContentType: 'application/pdf',
+  });
+  const url = await getSignedUrl(s3, command, { expiresIn: 300 });           // seconds
+  res.status(201).json({ key, url });
+});
+```
+<p class="pit"><b>Common mistake</b> Saving uploads to the server's local disk. A redeploy wipes them, and with two servers the file exists on only one. The related mistake is using the client's filename as the key: names collide, and a crafted name can overwrite someone else's object.</p>
+<p class="more">Go deeper: <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html">AWS: presigned URLs</a></p>
+</article>
+
+<article class="topic" id="data-consistency" data-k="strong eventual read-your-writes stale dual write source of truth">
+<h3>Data Consistency</h3>
+<p class="lede">The moment data has a second copy, such as a cache entry or a replica, a new question appears: after a write, when does every reader see it? Consistency models are the possible answers.</p>
+<p>This is a different idea from the C in <a href="#acid">ACID</a>, which is about constraints inside one database.</p>
+<div class="tbl"><table>
+<tr><th>Model</th><th>Promise</th><th>Where you get it</th></tr>
+<tr><td>Strong</td><td>Every read returns the latest write</td><td>Reading the primary database</td></tr>
+<tr><td>Eventual</td><td>Copies converge if writes stop; a read may be stale meanwhile</td><td>Caches, asynchronous replicas</td></tr>
+<tr><td>Read-your-writes</td><td>You always see your own changes; others may lag</td><td>Sending a user's reads to the primary just after they write</td></tr>
+</table></div>
+<p>You choose per piece of data, by asking what a stale read costs:</p>
+<ul>
+<li><b>Stock at checkout</b>: a stale read oversells. Read the primary, inside the <a href="#transactions">transaction</a>.</li>
+<li><b>Product description</b>: a stale read shows old text for a few minutes. A cached copy is fine.</li>
+<li><b>"My orders" right after ordering</b>: a stale read looks like a lost order. Needs read-your-writes.</li>
+</ul>
+<p class="pit"><b>Common mistake</b> The dual write: update Postgres, then update a second system, and assume both happened. If the process dies between them the copies disagree, with nothing to repair them. Keep one source of truth, make the copies disposable (delete the cache key and let the TTL catch misses), and never update a copy first.</p>
+<p>Keeping separate services in step is covered in <a href="#distributed-transactions">Distributed Transactions</a>.</p>
+<p class="more">Go deeper: <a href="https://jepsen.io/consistency">Jepsen: consistency models</a></p>
+</article>
+
+<article class="topic" id="replication" data-k="primary replica standby read replica lag failover synchronous asynchronous wal streaming backup">
+<h3>Database Replication</h3>
+<p class="lede">Replication keeps live copies of the database on other servers. It buys two things: a standby that can take over if the main server dies, and extra servers to answer reads.</p>
+<div class="flow">
+<span>App writes</span><i>→</i><span class="hot">Primary</span><i>WAL stream →</i><span>Replica 1</span><span>Replica 2</span><i>←</i><span>App reads</span>
+</div>
+<p>One server, the <b>primary</b>, accepts writes. It streams its <a href="#acid">write-ahead log</a> to <b>replicas</b>, which replay it and serve read-only queries.</p>
+<div class="tbl"><table>
+<tr><th></th><th>Asynchronous (default)</th><th>Synchronous</th></tr>
+<tr><td>Commit returns</td><td>As soon as the primary has it</td><td>After a replica confirms it too</td></tr>
+<tr><td>Write speed</td><td>Unaffected</td><td>Slower: each commit waits on the network</td></tr>
+<tr><td>If the primary dies</td><td>The last few commits may be lost</td><td>Nothing confirmed is lost</td></tr>
+<tr><td>Replica reads</td><td>Slightly behind (replication lag)</td><td>Can still lag unless configured to wait for replay</td></tr>
+</table></div>
+<p>In the application, replication shows up as a second pool and a decision per query:</p>
+```ts title=src/db.ts
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });               // primary
+export const replica = new Pool({ connectionString: process.env.DATABASE_REPLICA_URL });    // read-only
+
+// Can this read be a little stale?  -> replica
+// A write, or a read right after one -> pool
+```
+<p class="pit"><b>Common mistake</b> Writing to the primary and reading the result from a replica in the same request. The replica may be milliseconds behind, so the user saves a change and sees the old value. A second trap: replication is not a backup. A mistaken `DELETE` reaches every replica within moments.</p>
+<p>Automatic failover and what happens when servers disagree are covered in <a href="#dist-replication">Replication</a> in Distributed Systems.</p>
+<p class="more">Go deeper: <a href="https://www.postgresql.org/docs/current/high-availability.html">PostgreSQL: high availability and replication</a></p>
+</article>
+</section>

@@ -1,0 +1,232 @@
+<section class="cat" id="distributed" data-title="Distributed Systems">
+<header class="cat-head">
+  <p class="eyebrow">07 · Scale</p>
+  <h2>Distributed Systems</h2>
+  <p class="sum">One server is simple and has a ceiling. Past it you run several machines that must act as one system while any of them, or the network between them, can fail at any moment.</p>
+</header>
+
+<article class="topic" id="vertical-scaling" data-k="scale up bigger machine cores ram cluster availableParallelism single point of failure">
+<h3>Vertical Scaling</h3>
+<p class="lede">Vertical scaling means giving one server more CPU, memory or faster disk. It is the first move because nothing about the architecture changes.</p>
+<div class="tbl"><table>
+<tr><th>For</th><th>Against</th></tr>
+<tr><td style="white-space:normal;font-weight:400">No code changes<br>No distributed-systems problems<br>Databases benefit directly</td><td>A hard ceiling: the biggest machine on offer<br>Cost grows faster than capacity at the top end<br>Still one machine: if it dies, everything is down</td></tr>
+</table></div>
+<p>There is a catch for Node. A bigger machine mostly means more cores, and one Node process runs JavaScript on <a href="#cpu-memory">one of them</a>. To use the rest, run one process per core. The built-in `cluster` module does that and shares a single port among them:</p>
+```ts title=src/cluster.ts
+import cluster from 'node:cluster';
+import { availableParallelism } from 'node:os';
+
+if (cluster.isPrimary) {
+  for (let i = 0; i < availableParallelism(); i++) cluster.fork();
+  cluster.on('exit', () => cluster.fork());        // replace a worker that died
+} else {
+  await import('./server.ts');                     // each worker runs the normal server
+}
+```
+<p>On container platforms you skip this and run more one-core containers, which is already horizontal scaling.</p>
+<p class="pit"><b>Common mistake</b> Reaching for many servers while the database sits on a small machine. Doubling the database's memory is often the cheapest performance fix available. Scale up until it stops being cheap.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/cluster.html">Node.js: cluster</a></p>
+</article>
+
+<article class="topic" id="horizontal-scaling" data-k="scale out stateless instances replicas shared nothing session sticky">
+<h3>Horizontal Scaling</h3>
+<p class="lede">Horizontal scaling means adding more servers that run the same code and sharing requests among them. Capacity grows by adding machines, and losing one is survivable.</p>
+<p>It has one requirement: the app must be <b>stateless</b>. Any instance must be able to serve any request, so nothing a later request needs may live in one instance's memory or on its disk.</p>
+<div class="tbl"><table>
+<tr><th>Breaks with two instances</th><th>Move it to</th></tr>
+<tr><td>Sessions in a `Map`</td><td><a href="#redis">Redis</a>, or a signed token the client holds</td></tr>
+<tr><td>Uploads on local disk</td><td><a href="#object-storage">Object storage</a></td></tr>
+<tr><td>In-memory cache or counters</td><td>Redis</td></tr>
+<tr><td>An in-process <a href="#mutexes">mutex</a></td><td>A database lock or distributed lock</td></tr>
+<tr><td>`setInterval` jobs (now run on every instance)</td><td>An <a href="#locks">advisory lock</a>, or one dedicated worker</td></tr>
+</table></div>
+<p>The app tier scales out easily once it is stateless. The database does not, because it <em>is</em> the state. It scales through <a href="#replication">replication</a> and <a href="#partitioning">partitioning</a>.</p>
+<p class="pit"><b>Common mistake</b> Finding hidden state only after adding the second instance: "users get logged out at random" means sessions live in memory. Run two instances in staging from the start so these fail early.</p>
+<p class="more">Go deeper: <a href="https://12factor.net/processes">The Twelve-Factor App: processes</a></p>
+</article>
+
+<article class="topic" id="load-balancing" data-k="load balancer round robin least connections health check readiness liveness layer 4 layer 7">
+<h3>Load Balancing</h3>
+<p class="lede">With several instances, something must decide which one gets each request. A load balancer is a server that accepts all incoming traffic and forwards each request to a healthy instance.</p>
+<div class="flow">
+<span>Clients</span><i>→</i><span class="hot">Load balancer</span><i>→</i><span>API 1</span><span>API 2</span><span>API 3 <b>failing check: skipped</b></span>
+</div>
+<div class="tbl"><table>
+<tr><th>Algorithm</th><th>Sends each request to</th><th>Fits</th></tr>
+<tr><td>Round robin</td><td>The next instance in turn</td><td>Similar instances, similar requests</td></tr>
+<tr><td>Least connections</td><td>The instance with the fewest open requests</td><td>Request times that vary a lot</td></tr>
+<tr><td>Hash</td><td>The instance chosen by hashing a key, such as client IP</td><td>When one client should keep hitting one instance</td></tr>
+</table></div>
+<p>The balancer learns which instances are usable by polling a <b>health check</b> endpoint. Give it two different answers:</p>
+```ts title=src/app.ts
+export const lifecycle = { draining: false };      // server.ts sets this on SIGTERM
+
+app.get('/health', (_req, res) => {                // liveness: is the process running?
+  res.json({ ok: true });
+});
+
+app.get('/ready', async (_req, res) => {           // readiness: can it take traffic?
+  if (lifecycle.draining) {
+    res.status(503).json({ ok: false });
+    return;
+  }
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+```
+<p>Failing readiness takes the instance out of rotation until it recovers. Failing liveness gets it restarted. During <a href="#processes">shutdown</a>, failing readiness first lets the balancer stop sending traffic before the process exits.</p>
+<p class="pit"><b>Common mistake</b> Checking the database in the liveness probe. A short database outage then makes the platform restart every instance at once, and they all come back to a cold start together. Dependencies belong in readiness only.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#load-balancer">System Design Primer: load balancer</a></p>
+</article>
+
+<article class="topic" id="dist-replication" data-k="failover leader election consensus raft split brain multi-leader leaderless quorum">
+<h3>Replication</h3>
+<p class="lede"><a href="#replication">Database Replication</a> covered one primary streaming to replicas. The distributed question is what happens when the primary dies, and what other layouts exist.</p>
+<h4>Failover</h4>
+<p>A replica must be promoted to primary. Doing it safely requires the surviving nodes to agree on exactly one new leader. If two nodes both believe they are primary (<b>split brain</b>), both accept writes and the data diverges. Systems prevent this with <b>consensus</b>: a node leads only when a majority votes for it, and two majorities cannot exist at once. That is why clusters have odd sizes such as three or five.</p>
+<h4>Other layouts</h4>
+<div class="tbl"><table>
+<tr><th>Layout</th><th>Who accepts writes</th><th>Price</th></tr>
+<tr><td>Single leader</td><td>One node</td><td>Writes stop briefly during failover</td></tr>
+<tr><td>Multi-leader</td><td>Several, often one per region</td><td>Two leaders can change the same row: conflicts need a resolution rule</td></tr>
+<tr><td>Leaderless</td><td>Any node; a write succeeds once enough nodes confirm it</td><td>Readers must reconcile differing copies</td></tr>
+</table></div>
+<p>Single leader is the default for good reason. Managed Postgres services run the election and promotion for you.</p>
+<p>Your part is to survive the switch. Connections to the old primary break, so handle the error instead of crashing, and let the pool reconnect:</p>
+```ts title=src/db.ts
+// An idle pooled connection can fail at any time. With no listener, this error exits the process.
+pool.on('error', (err) => console.error('postgres connection lost', err));
+```
+<p class="pit"><b>Common mistake</b> Assuming failover loses nothing. With asynchronous replication, the commits the old primary had not yet shipped are gone. If that is unacceptable for some writes, those need synchronous replication.</p>
+<p class="more">Go deeper: <a href="https://raft.github.io/">Raft consensus, with an interactive visualisation</a></p>
+</article>
+
+<article class="topic" id="partitioning" data-k="sharding shard key hash range hot partition consistent hashing table partitioning rebalancing">
+<h3>Partitioning</h3>
+<p class="lede">Replication copies the same data to more machines. Partitioning, also called <b>sharding</b>, splits the data so each machine holds a different part. It is how you scale writes and storage past one server.</p>
+<p>A <b>partition key</b> decides where each row lives:</p>
+<div class="tbl"><table>
+<tr><th>Strategy</th><th>Rule</th><th>Good at</th><th>Risk</th></tr>
+<tr><td>Range</td><td>Keys A to M here, N to Z there</td><td>Range scans, time-ordered data</td><td>Uneven load: the newest range gets all the writes</td></tr>
+<tr><td>Hash</td><td>`hash(key) % shards`</td><td>Even spread</td><td>Range queries must ask every shard</td></tr>
+</table></div>
+```ts
+import { createHash } from 'node:crypto';
+
+const shards = [poolA, poolB, poolC, poolD];
+
+export function shardFor(userId: string) {
+  const hash = createHash('sha1').update(userId).digest().readUInt32BE(0);
+  return shards[hash % shards.length];   // all of one user's data lives on one shard
+}
+```
+<p>The costs are real. A join or <a href="#transactions">transaction</a> across shards is no longer something the database does for you. And with plain modulo, adding a shard moves almost every key; <b>consistent hashing</b> is the technique that moves only a fraction.</p>
+<p>Before sharding across servers, Postgres can partition one large table on a single server. Queries on a date range then touch only the matching partitions, and old data is removed by dropping a partition:</p>
+```sql
+CREATE TABLE events (
+  user_id    bigint NOT NULL,
+  created_at timestamptz NOT NULL,
+  payload    jsonb NOT NULL
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_11 PARTITION OF events
+  FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+```
+<p class="pit"><b>Common mistake</b> A partition key that concentrates load. Shard by country and one large country overloads its shard while others idle (a <b>hot partition</b>). Choose a key with many values, evenly used, that most queries already filter by.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#sharding">System Design Primer: sharding</a> · <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">PostgreSQL: table partitioning</a></p>
+</article>
+
+<article class="topic" id="dist-consistency" data-k="cap theorem partition availability pacelc quorum cp ap linearizable">
+<h3>Consistency</h3>
+<p class="lede"><a href="#data-consistency">Data Consistency</a> introduced strong and eventual consistency. In a distributed system the choice is forced on you by one event: a <b>network partition</b>, when nodes are running but cannot reach each other.</p>
+<p>During a partition, a node that receives a request has two options. This is the <b>CAP theorem</b>:</p>
+<div class="tbl"><table>
+<tr><th>Choice</th><th>The node</th><th>You get</th><th>Suits</th></tr>
+<tr><td>Consistency (CP)</td><td>Refuses, because it cannot confirm it has the latest data</td><td>Errors, never wrong answers</td><td>Payments, stock, anything you cannot undo</td></tr>
+<tr><td>Availability (AP)</td><td>Answers with what it has</td><td>Answers that may be stale or conflict later</td><td>Feeds, carts, view counts</td></tr>
+</table></div>
+<p>Partitions are rare, and the trade-off does not vanish between them. Confirming a write with other nodes takes time, so even on a healthy network stronger consistency costs latency.</p>
+<p>Leaderless stores expose the dial directly as a <b>quorum</b>. With N copies, a write waits for W of them and a read asks R. If `R + W > N`, every read overlaps at least one node that has the latest write. With N = 3, choosing W = 2 and R = 2 gives up-to-date reads and still tolerates one node down.</p>
+<p>A single-primary Postgres setup is a CP choice: if the primary is unreachable, writes fail instead of forking.</p>
+<p class="pit"><b>Common mistake</b> Reading CAP as "pick two of three". You cannot opt out of network failures. The only real choice is what to do when one happens, and you can make it differently for each kind of data.</p>
+<p class="more">Go deeper: <a href="https://github.com/donnemartin/system-design-primer#cap-theorem">System Design Primer: CAP theorem</a> · <a href="https://jepsen.io/consistency">Jepsen: consistency models</a></p>
+</article>
+
+<article class="topic" id="fault-tolerance" data-k="timeout circuit breaker fallback graceful degradation cascading failure redundancy bulkhead abort signal">
+<h3>Fault Tolerance</h3>
+<p class="lede">With enough machines, something is always broken. A fault-tolerant system keeps working, perhaps with less, when a component fails. The goal is to stop one failure from becoming everyone's failure.</p>
+<div class="tbl"><table>
+<tr><th>Tool</th><th>What it does</th></tr>
+<tr><td>Redundancy</td><td>More than one of everything, so no single machine is essential</td></tr>
+<tr><td>Timeout</td><td>Stops waiting on a dependency that has gone quiet</td></tr>
+<tr><td><a href="#retries">Retry</a></td><td>Tries again when the failure is likely temporary</td></tr>
+<tr><td>Circuit breaker</td><td>After repeated failures, stops calling the dependency for a while and fails immediately</td></tr>
+<tr><td>Fallback</td><td>Serves a reduced answer instead of an error</td></tr>
+</table></div>
+<p>The timeout comes first, because a slow dependency does more harm than a dead one. A dead service fails fast. A slow one holds your requests open until your own connections and memory run out, and then your callers start timing out too. That chain is a <b>cascading failure</b>.</p>
+```ts
+export async function getRecommendations(userId: string): Promise<Product[]> {
+  try {
+    const res = await fetch(`${config.RECS_URL}/users/${userId}`, {
+      signal: AbortSignal.timeout(300),            // give up after 300 ms
+    });
+    if (!res.ok) throw new Error(`recommendations: ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    console.warn('recommendations unavailable', err);
+    return [];                                     // fallback: the page renders without them
+  }
+}
+```
+<p>A <b>circuit breaker</b> wraps a call like this and counts failures. Past a threshold it "opens" and skips the call entirely for a cooling-off period, which spares both your service and the struggling one. Then it lets a trial request through to see whether to close again. In Node, the `opossum` library provides one.</p>
+<p class="pit"><b>Common mistake</b> Outbound calls with no timeout. `fetch` will wait indefinitely by default, and so will a database query unless you set a limit. Every call that leaves the process needs a deadline.</p>
+<p class="more">Go deeper: <a href="https://martinfowler.com/bliki/CircuitBreaker.html">Martin Fowler: circuit breaker</a> · <a href="https://github.com/nodeshift/opossum">opossum</a></p>
+</article>
+
+<article class="topic" id="distributed-transactions" data-k="two-phase commit 2pc saga compensation outbox dual write skip locked at-least-once">
+<h3>Distributed Transactions</h3>
+<p class="lede">A <a href="#transactions">transaction</a> is all-or-nothing inside one database. When one operation spans two systems, say the orders database and a payment service, there is no shared `COMMIT`. Either side can succeed while the other fails.</p>
+<div class="tbl"><table>
+<tr><th>Approach</th><th>How</th><th>Trade-off</th></tr>
+<tr><td>Two-phase commit</td><td>A coordinator asks every participant to prepare, then tells all to commit</td><td>Truly atomic, but everyone holds locks while waiting, and a crashed coordinator leaves them stuck</td></tr>
+<tr><td>Saga</td><td>A chain of local transactions. If a step fails, earlier steps are undone by <b>compensating</b> actions, such as a refund</td><td>No global locks. Other requests can see the half-finished state.</td></tr>
+<tr><td>Outbox</td><td>Write the data and a "to be sent" message in one local transaction; a relay delivers the message afterwards</td><td>Simple and reliable. The other side learns a moment later.</td></tr>
+</table></div>
+<p>The outbox is the one to know first. It fixes the <a href="#data-consistency">dual write</a>: the order and its event are saved together, so an event can never exist without its order or the reverse.</p>
+```sql
+CREATE TABLE outbox (
+  id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  topic        text NOT NULL,
+  payload      jsonb NOT NULL,
+  published_at timestamptz
+);
+```
+```ts
+// 1. Inside placeOrder's transaction, next to the inserts:
+await tx.query(
+  'INSERT INTO outbox (topic, payload) VALUES ($1, $2)',
+  ['order.placed', { orderId: order.rows[0].id, userId }],
+);
+
+// 2. The relay: a loop in a separate worker process
+await withTransaction(async (tx) => {
+  const { rows } = await tx.query(
+    `SELECT id, topic, payload FROM outbox
+      WHERE published_at IS NULL
+      ORDER BY id LIMIT 100
+      FOR UPDATE SKIP LOCKED`,              // several relays can run without colliding
+  );
+  for (const row of rows) await publish(row.topic, row.payload);
+  await tx.query('UPDATE outbox SET published_at = now() WHERE id = ANY($1)', [rows.map((r) => r.id)]);
+});
+```
+<p>If the relay crashes after publishing and before the update, the message goes out again on the next run. Delivery is therefore <b>at least once</b>, and receivers must tolerate duplicates (see <a href="#idempotency">Idempotency</a>). `publish` sends to a queue, which is the next chapter.</p>
+<p class="pit"><b>Common mistake</b> Splitting data that changes together across two services, then needing a distributed transaction to keep it in step. If two things must be atomic, the cheapest answer is usually to keep them in one database.</p>
+<p class="more">Go deeper: <a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io: transactional outbox</a> · <a href="https://microservices.io/patterns/data/saga.html">saga</a></p>
+</article>
+</section>

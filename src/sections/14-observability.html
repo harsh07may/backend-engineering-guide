@@ -1,0 +1,269 @@
+<section class="cat" id="observability" data-title="Observability">
+<header class="cat-head">
+  <p class="eyebrow">14 · Shipping</p>
+  <h2>Observability</h2>
+  <p class="sum">In production you cannot attach a debugger. Observability is how well you can tell what the system is doing from the outside, using what it emits: logs, metrics and traces.</p>
+</header>
+
+<article class="topic" id="logging" data-k="logs structured json pino pino-http log level request id correlation redact stdout">
+<h3>Logging</h3>
+<p class="lede">A log is a timestamped record of something that happened. Logs answer the detailed question: what exactly occurred for this request?</p>
+<p>The earlier chapters used `console.log`. Production logs need three more properties:</p>
+<ul>
+<li><b>Structured.</b> Each line is a JSON object, so a log system can filter by field: every line for one order, every error from one route.</li>
+<li><b>Levelled.</b> `debug`, `info`, `warn`, `error`. Production runs at `info`, and you lower it when investigating.</li>
+<li><b>Correlated.</b> Every line carries a <b>request id</b>, so all lines from one request can be pulled together.</li>
+</ul>
+```bash
+npm i pino pino-http
+```
+```ts title=src/logger.ts
+import { randomUUID } from 'node:crypto';
+import pino from 'pino';
+import { pinoHttp } from 'pino-http';
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? 'info',
+  redact: ['req.headers.authorization', 'req.headers.cookie'],   // never write credentials
+});
+
+export const httpLogger = pinoHttp({
+  logger,
+  genReqId: (req, res) => {
+    const id = req.headers['x-request-id']?.toString() ?? randomUUID();   // reuse the caller's id
+    res.setHeader('x-request-id', id);
+    return id;
+  },
+});
+```
+```ts title=src/app.ts
+app.use(httpLogger);                       // one line per request, plus req.log for your own
+
+orders.post('/', async (req, res) => {
+  // …
+  req.log.info({ orderId: order.id, totalCents: order.total_cents }, 'order placed');
+});
+
+const onError: ErrorRequestHandler = (err, req, res, _next) => {
+  req.log.error({ err }, 'unhandled error');           // stack trace goes to the log, not the client
+  res.status(500).json({ title: 'Internal Server Error', status: 500 });
+};
+```
+```json
+{"level":30,"time":1794719000123,"req":{"id":"7c1e…","method":"POST","url":"/v1/orders"},"orderId":"1042","totalCents":1000,"msg":"order placed"}
+```
+<p>Write logs to standard output and let the platform collect them. The app should not manage log files.</p>
+<p class="pit"><b>Common mistake</b> Logging secrets and personal data: tokens, passwords, whole request bodies. Logs are copied widely and kept for a long time. Log identifiers such as `orderId` and `userId`, and redact the rest.</p>
+<p class="more">Go deeper: <a href="https://getpino.io/">Pino docs</a></p>
+</article>
+
+<article class="topic" id="metrics" data-k="metric counter gauge histogram prometheus prom-client red method labels cardinality scrape">
+<h3>Metrics</h3>
+<p class="lede">A metric is a number measured over time: requests per second, error rate, memory in use. Logs describe single events. Metrics describe the whole, cheaply, which makes them the basis for dashboards and alerts.</p>
+<div class="tbl"><table>
+<tr><th>Type</th><th>Behaviour</th><th>Example</th></tr>
+<tr><td>Counter</td><td>Only goes up</td><td>Requests served, orders placed</td></tr>
+<tr><td>Gauge</td><td>Goes up and down</td><td>Connections in use, queue length</td></tr>
+<tr><td>Histogram</td><td>Counts observations into buckets, so <a href="#latency">percentiles</a> can be computed</td><td>Request duration</td></tr>
+</table></div>
+<p>For a request-serving system, three metrics per endpoint tell most of the story (the RED method): <b>R</b>ate of requests, <b>E</b>rrors, <b>D</b>uration. One histogram with labels gives all three.</p>
+<p>The usual setup is Prometheus: the app exposes current values at `/metrics`, and a Prometheus server collects ("scrapes") them every few seconds.</p>
+```bash
+npm i prom-client
+```
+```ts title=src/metrics.ts
+import client from 'prom-client';
+import type { RequestHandler } from 'express';
+
+client.collectDefaultMetrics();                    // memory, CPU, event loop lag
+
+const duration = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+});
+
+export const measure: RequestHandler = (req, res, next) => {
+  const stop = duration.startTimer();
+  res.on('finish', () => {
+    stop({
+      method: req.method,
+      route: req.route ? req.baseUrl + req.route.path : 'unmatched',   // '/v1/orders/:id', not the raw URL
+      status: res.statusCode,
+    });
+  });
+  next();
+};
+
+export const metricsEndpoint: RequestHandler = async (_req, res) => {
+  res.type(client.register.contentType).send(await client.register.metrics());
+};
+```
+```ts title=src/app.ts
+app.use(measure);
+app.get('/metrics', metricsEndpoint);    // expose on an internal port or path only
+```
+<p>The library's project now lives under the Prometheus organisation, whose docs call the package `@prometheus-io/client`. The API shown here is the same.</p>
+<p class="pit"><b>Common mistake</b> Labels with unlimited values, such as a user id or the raw URL. Each distinct combination becomes its own time series, and millions of them exhaust the metrics server. Labels must come from a small fixed set. Per-user detail belongs in logs.</p>
+<p class="more">Go deeper: <a href="https://prometheus.io/docs/concepts/metric_types/">Prometheus: metric types</a></p>
+</article>
+
+<article class="topic" id="tracing" data-k="distributed tracing trace span opentelemetry otel traceparent context propagation sampling jaeger">
+<h3>Distributed Tracing</h3>
+<p class="lede">When a request crosses several services, logs and metrics from each one show fragments. A trace joins them: one record of the request's whole journey, with the time spent at every step.</p>
+<ul>
+<li>A <b>trace</b> is one request end to end, identified by a trace id.</li>
+<li>A <b>span</b> is one step within it: an HTTP call, a query, a function. Each has a start, a duration and a parent span.</li>
+<li><b>Context propagation</b> carries the trace id to the next service in a `traceparent` header, so its spans join the same trace.</li>
+</ul>
+```text title=one trace, drawn as a timeline
+POST /v1/orders                                  212 ms
+├─ auth: verify token                              2 ms
+├─ postgres: BEGIN … COMMIT                       31 ms
+├─ POST catalog/v1/reservations                  170 ms   ← the time went here
+│   └─ postgres: UPDATE products                 158 ms
+└─ redis: DEL product:7                            1 ms
+```
+<p><b>OpenTelemetry</b> is the vendor-neutral standard for producing this data. Its Node SDK instruments Express, `pg`, Redis and `fetch` automatically, so you get spans without touching handlers:</p>
+```bash
+npm i @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node @opentelemetry/exporter-trace-otlp-proto
+```
+```ts title=src/tracing.ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+
+const sdk = new NodeSDK({
+  serviceName: 'orders-api',
+  traceExporter: new OTLPTraceExporter(),          // sends to a collector at localhost:4318 by default
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+```
+```bash
+# Tracing must load before the app, so it can wrap the libraries as they are imported
+node --experimental-loader=@opentelemetry/instrumentation/hook.mjs --import ./src/tracing.ts src/server.ts
+```
+<p>The loader flag is needed because this project uses ES modules. For a step the libraries cannot see, add a span yourself:</p>
+```ts
+import { trace } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('orders');
+
+const invoice = await tracer.startActiveSpan('generate-invoice', async (span) => {
+  try {
+    return await generateInvoice(orderId);
+  } finally {
+    span.end();                                   // a span must always be ended
+  }
+});
+```
+<p>Traces go to a backend such as Jaeger or Grafana Tempo, where you search by trace id. Put that id in your <a href="#logging">logs</a> too and you can jump from a slow trace to its log lines.</p>
+<p class="pit"><b>Common mistake</b> Losing the trace at an asynchronous boundary. A job placed on a <a href="#message-queues">queue</a> starts a new, unrelated trace unless the trace context is put in the message and restored by the worker.</p>
+<p class="more">Go deeper: <a href="https://opentelemetry.io/docs/languages/js/getting-started/nodejs/">OpenTelemetry: Node.js getting started</a></p>
+</article>
+
+<article class="topic" id="monitoring" data-k="dashboard golden signals grafana prometheus promql synthetic check black-box white-box health">
+<h3>Monitoring</h3>
+<p class="lede">Monitoring is watching the system's health continuously, so that you learn about a problem from your own tools and before your users tell you.</p>
+<p>Start with what users experience. Four measurements, the <b>golden signals</b>, describe any service:</p>
+<div class="tbl"><table>
+<tr><th>Signal</th><th>Question</th><th>From</th></tr>
+<tr><td>Latency</td><td>How long do requests take?</td><td>The <a href="#metrics">duration histogram</a></td></tr>
+<tr><td>Traffic</td><td>How much demand is there?</td><td>Request rate</td></tr>
+<tr><td>Errors</td><td>What share of requests fail?</td><td>Rate of 5xx responses</td></tr>
+<tr><td>Saturation</td><td>How close to full is it?</td><td>CPU, memory, pool wait, queue depth</td></tr>
+</table></div>
+<p>With Prometheus collecting the histogram from <a href="#metrics">Metrics</a>, each signal is a short query, shown on a Grafana dashboard:</p>
+```text title=PromQL
+# Traffic: requests per second
+sum(rate(http_request_duration_seconds_count[5m]))
+
+# Errors: share of requests answered with a 5xx
+sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m]))
+  / sum(rate(http_request_duration_seconds_count[5m]))
+
+# Latency: 95th percentile, per route
+histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+```
+<p>Watch from two sides:</p>
+<ul>
+<li><b>From inside</b> (white-box): the metrics the app reports. Detailed, but silent if the app cannot be reached at all.</li>
+<li><b>From outside</b> (black-box): a <b>synthetic check</b> that calls a real endpoint every minute from another network, as a user would. It catches DNS, certificate and routing failures that inside metrics never see.</li>
+</ul>
+<p>Watch dependencies as well: database connections and replication lag, queue depth and the <a href="#dead-letter-queues">dead-letter queue</a>, certificate expiry dates.</p>
+<p class="pit"><b>Common mistake</b> Monitoring machines instead of the service. CPU and memory graphs can all look normal while every checkout fails. Lead with the golden signals for the journeys that matter, and use machine metrics to explain them.</p>
+<p class="more">Go deeper: <a href="https://sre.google/sre-book/monitoring-distributed-systems/">Google SRE book: monitoring distributed systems</a></p>
+</article>
+
+<article class="topic" id="alerts" data-k="alerting pager on-call threshold alert fatigue runbook severity burn rate prometheus rule symptom">
+<h3>Alerts</h3>
+<p class="lede">Nobody watches dashboards at 3 a.m. An alert is a rule that watches a metric and notifies a person when a condition holds. The hard part is deciding what deserves to interrupt someone.</p>
+<p>A good alert passes three tests:</p>
+<ul>
+<li><b>It reflects user impact.</b> Alert on symptoms (errors, slowness) over causes (high CPU). A cause without a symptom can wait until morning.</li>
+<li><b>It is actionable.</b> The person paged can do something about it now.</li>
+<li><b>It is rare.</b> If it fires weekly and is ignored, it trains people to ignore the real one. This is alert fatigue.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>Severity</th><th>Meaning</th><th>Goes to</th></tr>
+<tr><td>Page</td><td>Users are affected now</td><td>The on-call engineer's phone</td></tr>
+<tr><td>Ticket</td><td>Needs attention within days: disk at 80%, a certificate expiring next week</td><td>The team's queue</td></tr>
+<tr><td>Neither</td><td>Interesting but not actionable</td><td>A dashboard only</td></tr>
+</table></div>
+```yaml title=alerts/orders-api.yaml
+groups:
+  - name: orders-api
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m]))
+            / sum(rate(http_request_duration_seconds_count[5m])) > 0.02
+        for: 5m                          # must hold for 5 minutes: ignores brief blips
+        labels: { severity: page }
+        annotations:
+          summary: "More than 2% of requests are failing"
+          runbook: "https://wiki.shop.com/runbooks/orders-api-errors"
+
+      - alert: SlowRequests
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: { severity: page }
+```
+<p>Every paging alert should link to a <b>runbook</b>: what the alert means, how to check its scope, and the first steps to try. Thresholds should come from your <a href="#availability">SLO</a>, so that an alert means "we are using up our allowed failures too quickly".</p>
+<p class="pit"><b>Common mistake</b> An alert for every metric. A flood of pages hides the one that matters and burns out the people on call. Review alerts regularly, and delete or downgrade any that did not need action.</p>
+<p class="more">Go deeper: <a href="https://sre.google/workbook/alerting-on-slos/">Google SRE workbook: alerting on SLOs</a></p>
+</article>
+
+<article class="topic" id="production-debugging" data-k="incident debugging postmortem rollback mitigate root cause pg_stat_activity correlation evidence">
+<h3>Production Debugging</h3>
+<p class="lede">Something is wrong in production. You cannot pause it or step through it, and users are affected while you look. The skill is a disciplined order of work and reasoning from evidence the system already emits.</p>
+<ol class="seq">
+<li><b>Scope</b><span>What is failing, for whom, since when? One endpoint or all? One instance or every one?</span></li>
+<li><b>What changed?</b><span>A deploy, a config change, a migration, a traffic spike. Most incidents begin with a change.</span></li>
+<li><b>Mitigate</b><span>Stop the harm before understanding it: <a href="#ci-cd">roll back</a>, add capacity, turn the feature off.</span></li>
+<li><b>Narrow</b><span>Metrics say where. Traces say which step. Logs say exactly what.</span></li>
+<li><b>Test a hypothesis</b><span>State a cause that explains every symptom and check a prediction it makes.</span></li>
+<li><b>Fix and learn</b><span>Fix the cause, then write down what happened and what will catch it earlier next time.</span></li>
+</ol>
+<p>Each kind of signal answers a different part of step 4:</p>
+<div class="tbl"><table>
+<tr><th>Signal</th><th>Narrows to</th><th>Example finding</th></tr>
+<tr><td><a href="#metrics">Metrics</a></td><td>Which endpoint or instance, and when it started</td><td>p95 of `POST /v1/orders` tripled at 14:02</td></tr>
+<tr><td><a href="#tracing">Traces</a></td><td>Which step inside the request</td><td>The time is in a database call</td></tr>
+<tr><td><a href="#logging">Logs</a></td><td>What happened for one request id</td><td>`40P01` deadlock errors on the stock update</td></tr>
+</table></div>
+<p>The database can report on itself while it is struggling. This shows what is running now and what each query is waiting for:</p>
+```sql
+SELECT pid, state, wait_event_type, now() - query_start AS running_for, left(query, 80) AS query
+  FROM pg_stat_activity
+ WHERE state <> 'idle'
+ ORDER BY running_for DESC;
+```
+<p>Many rows waiting on a `Lock` point at <a href="#deadlocks">lock contention</a>. One query running for minutes points at a missing <a href="#indexes">index</a> or a missing <a href="#connection-pooling">timeout</a>. The <a href="#bottlenecks">bottleneck table</a> maps other symptoms to causes.</p>
+<p>Afterwards, write a <b>postmortem</b>: a timeline, the cause, and concrete follow-ups such as a new alert, a test or a guard. Keep it blameless. The question is what allowed the mistake, because that is what you can fix.</p>
+<p class="pit"><b>Common mistake</b> Restarting first. It often restores service and also destroys the evidence: the heap, the stuck queries, the open connections. If you can afford thirty seconds, capture a <a href="#memory-leaks">heap snapshot</a> or the query above, then restart.</p>
+<p class="more">Go deeper: <a href="https://sre.google/sre-book/effective-troubleshooting/">Google SRE book: effective troubleshooting</a></p>
+</article>
+</section>

@@ -1,0 +1,89 @@
+<section class="cat on" id="start" data-title="Setup and conventions">
+<header class="cat-head">
+  <p class="eyebrow">00 · Start here</p>
+  <h2>Setup and conventions</h2>
+  <p class="sum">One small service, an orders API for a shop, runs through every chapter. Set it up once; later chapters add to it instead of starting over.</p>
+</header>
+
+<article class="topic" id="how-to-read" data-k="format structure sessions">
+<h3>How each topic is built</h3>
+<p>Every topic follows the same order: the problem it solves, how it works, how it looks in Express, one common mistake, and one link if you want more depth. Mark a topic as learned to track progress in the sidebar. Progress is saved in this browser only.</p>
+<p>Chapters follow the checklist numbering, and the sidebar groups them by theme. Where a topic builds on another, it links to it, so you can read in any order.</p>
+</article>
+
+<article class="topic" id="stack" data-k="node express typescript postgres redis zod versions">
+<h3>The stack</h3>
+<div class="tbl"><table>
+<tr><th>Tool</th><th>Version</th><th>Role</th></tr>
+<tr><td>Node.js</td><td>26 LTS</td><td>Runs JavaScript on the server. It also runs <code>.ts</code> files directly by erasing the type annotations (type stripping).</td></tr>
+<tr><td>Express</td><td>5</td><td>A thin HTTP framework: routing plus a chain of functions called middleware.</td></tr>
+<tr><td>TypeScript</td><td>5.8+</td><td>Type checker only. Node never reads <code>tsconfig.json</code>; <code>tsc</code> checks, Node runs.</td></tr>
+<tr><td>PostgreSQL</td><td>18</td><td>The relational database, reached through the <code>pg</code> driver.</td></tr>
+<tr><td>Redis</td><td>8</td><td>In-memory store for caching, reached through the official <code>redis</code> client.</td></tr>
+<tr><td>Zod</td><td>4</td><td>Validates untrusted input and gives you the matching TypeScript type.</td></tr>
+</table></div>
+<p>Why raw SQL through `pg` and no ORM? An ORM (object-relational mapper) hides the queries, and the queries are what the database chapters teach.</p>
+</article>
+
+<article class="topic" id="project-setup" data-k="tsconfig type stripping install npm app.ts server.ts">
+<h3>Project setup</h3>
+```bash
+mkdir orders-api && cd orders-api
+npm init -y && npm pkg set type=module
+npm i express pg redis zod
+npm i -D typescript @types/node @types/express @types/pg
+```
+<p>Node's type stripping only removes types. Anything that needs generated JavaScript (enums, parameter properties, decorators) fails at startup. This `tsconfig.json` makes `tsc` reject that syntax up front:</p>
+```json title=tsconfig.json
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "esnext",
+    "module": "nodenext",
+    "strict": true,
+    "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true
+  }
+}
+```
+<p>Two rules follow from it: imports name the real file (`./app.ts`, not `./app`), and types are imported with `import type`.</p>
+```ts title=src/app.ts
+import express from 'express';
+import type { ErrorRequestHandler } from 'express';
+
+export const app = express();
+app.use(express.json());            // parse JSON bodies into req.body
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+// routes from later chapters mount here
+
+// Error handler: four arguments, registered last.
+// Express 5 sends thrown errors and rejected promises here on its own.
+const onError: ErrorRequestHandler = (err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ title: 'Internal Server Error', status: 500 });
+};
+app.use(onError);
+```
+```ts title=src/server.ts
+import { app } from './app.ts';
+
+const port = Number(process.env.PORT ?? 3000);
+app.listen(port, (error) => {
+  if (error) throw error;           // e.g. EADDRINUSE: the port is taken
+  console.log(`listening on :${port}`);
+});
+```
+```bash
+node --watch --env-file=.env src/server.ts   # run, restart on change
+npx tsc                                      # type-check
+```
+<p>`app.ts` builds the app and `server.ts` starts it. Keeping them apart lets tests import the app without opening a port.</p>
+<p class="pit"><b>Common mistake</b> Copying Express 4 snippets. In Express 5 a bare `*` route must be named (`/*splat`), `req.query` cannot be reassigned, and `req.body` is `undefined` until a body parser runs.</p>
+<p class="more">Go deeper: <a href="https://nodejs.org/api/typescript.html">Node.js TypeScript docs</a> · <a href="https://expressjs.com/en/guide/migrating-5.html">Express 5 migration guide</a> · <a href="https://roadmap.sh/backend">roadmap.sh backend path</a></p>
+</article>
+</section>
