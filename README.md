@@ -6,10 +6,10 @@ Read it: https://harsh07may.github.io/backend-engineering-guide/
 
 ## Editing
 
-Each chapter is one file in `src/sections/`. The page shell (styles, sidebar, scripts) is `src/shell.html`.
+Each chapter is one file in `src/sections/`. The page shell (styles, sidebar, scripts) is `src/shell.html`, and the logo is `src/favicon.svg`.
 
 ```bash
-python3 build.py   # rebuilds index.html, fails on duplicate ids or broken internal links
+python3 build.py   # rebuilds index.html and favicon.svg, fails on duplicate ids or broken internal links
 ```
 
 The code samples are teaching code written against the library docs as of November 2026. They have not been run as a complete project.

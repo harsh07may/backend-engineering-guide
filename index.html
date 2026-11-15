@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Backend Engineering Field Guide</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<script>try{var t=localStorage.getItem('be-theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
@@ -25,6 +27,7 @@
     --tk-key:#e29ac6; --tk-str:#a5d39a; --tk-num:#e7b45a; --tk-fn:#8fb8f2;
   }
 }
+:root[data-theme="light"]{color-scheme:light}
 :root[data-theme="dark"]{
   color-scheme:dark;
   --bg:#10171a; --surface:#162024; --ink:#e2e9e6; --muted:#94a39e; --line:#27353b;
@@ -39,14 +42,23 @@ a{color:var(--accent);text-underline-offset:3px}
 
 /* sidebar */
 .side{border-right:1px solid var(--line);background:var(--surface);overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding:22px 16px 28px}
-.brand{font:700 19px/1.15 var(--display);letter-spacing:-.01em;margin:0 6px}
+.brand{display:flex;align-items:flex-start;gap:10px;font:700 19px/1.15 var(--display);letter-spacing:-.01em;margin:0 6px}
+.logo{flex:none;width:27px;height:27px;margin-top:-1px}
+.logo .wire{fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round}
+.logo .hub{fill:var(--accent)}
 .brand small{display:block;font:400 12.5px/1.4 var(--body);color:var(--muted);margin-top:4px;letter-spacing:0}
 #q{width:100%;font:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
 #q::placeholder{color:var(--muted)}
 #nav{display:flex;flex-direction:column;gap:2px}
 .part{font:600 11px/1 var(--body);letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:16px 8px 6px}
 .part:first-child{margin-top:2px}
-.nav-tools{display:flex;justify-content:flex-end;margin:-6px 2px -8px}
+.nav-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:-6px 2px -8px}
+#theme{display:flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:8px}
+#theme button{width:27px;height:22px;display:grid;place-items:center;padding:0;border:0;background:none;color:var(--muted);border-radius:6px;cursor:pointer}
+#theme button:hover{color:var(--ink);background:var(--bg)}
+#theme button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent)}
+#theme svg{display:block;width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round}
+#theme .fill{fill:currentColor;stroke:none}
 #collapse{font:500 12px var(--body);color:var(--muted);background:none;border:0;padding:4px 6px;border-radius:5px;cursor:pointer}
 #collapse:hover{color:var(--accent);background:var(--accent-soft)}
 .cat-row{display:flex;align-items:center;gap:2px}
@@ -145,7 +157,10 @@ td.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:13px}
   .nav-open .side{transform:none;box-shadow:0 0 0 100vmax rgba(0,0,0,.4)}
   #main{height:100%}
   .bar{display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 16px;font:700 15px var(--display)}
-  #menu{font:500 13px var(--body);border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:7px;padding:5px 11px;cursor:pointer}
+  #menu{flex:none;display:grid;place-items:center;width:34px;height:32px;padding:0;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:7px;cursor:pointer}
+  #menu svg{display:block;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round}
+  #menu:hover{border-color:var(--accent);color:var(--accent)}
+  .bar .logo{width:21px;height:21px;margin:0 -4px 0 0}
   .wrap{padding:26px 18px 72px}
   .seq li{grid-template-columns:22px minmax(0,1fr)}
   .seq li span{grid-column:2}
@@ -156,13 +171,20 @@ td.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:13px}
 </head>
 <body>
 <aside class="side" id="side">
-  <p class="brand">Backend Engineering<small>A field guide in Node.js, Express 5 and TypeScript</small></p>
+  <p class="brand"><svg class="logo" viewBox="0 0 24 24" role="img" aria-label="Backend Engineering Field Guide"><g class="wire"><path d="M10.15 8.43 6.9 14.48"/><path d="M13.85 8.43 17.1 14.48"/><path d="M9 18h6"/><circle cx="5" cy="18" r="2.6"/><circle cx="19" cy="18" r="2.6"/></g><circle class="hub" cx="12" cy="5" r="3"/></svg><span>Backend Engineering<small>A field guide in Node.js, Express 5 and TypeScript</small></span></p>
   <input id="q" type="search" placeholder="Search topics" aria-label="Search topics" autocomplete="off">
-  <div class="nav-tools"><button id="collapse" type="button">Collapse all</button></div>
+  <div class="nav-tools">
+    <div id="theme" role="group" aria-label="Theme">
+      <button type="button" data-theme="light" title="Light" aria-label="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3.05 3.05l1.15 1.15M11.8 11.8l1.15 1.15M3.05 12.95l1.15-1.15M11.8 4.2l1.15-1.15"/></svg></button>
+      <button type="button" data-theme="dark" title="Dark" aria-label="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M14 8.53A6 6 0 1 1 7.47 2 4.67 4.67 0 0 0 14 8.53z"/></svg></button>
+      <button type="button" data-theme="auto" title="Match system" aria-label="Match system theme"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path class="fill" d="M8 2a6 6 0 0 1 0 12z"/></svg></button>
+    </div>
+    <button id="collapse" type="button">Collapse all</button>
+  </div>
   <nav id="nav" aria-label="Chapters"></nav>
 </aside>
 <main id="main">
-  <div class="bar"><button id="menu" type="button" aria-controls="side">Chapters</button><span>Backend Engineering</span></div>
+  <div class="bar"><button id="menu" type="button" aria-controls="side" aria-expanded="false" aria-label="Chapters" title="Chapters"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12"/></svg></button><svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><g class="wire"><path d="M10.15 8.43 6.9 14.48"/><path d="M13.85 8.43 17.1 14.48"/><path d="M9 18h6"/><circle cx="5" cy="18" r="2.6"/><circle cx="19" cy="18" r="2.6"/></g><circle class="hub" cx="12" cy="5" r="3"/></svg><span>Backend Engineering</span></div>
   <div class="wrap">
 <section class="cat on" id="start" data-title="Setup and conventions">
 <header class="cat-head">
@@ -3600,7 +3622,7 @@ histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_
     current = cat.id;
     open[current] = 1;                       // arriving at a chapter expands it
     renderNav();
-    document.body.classList.remove('nav-open');
+    setNav(false);
     if (el === cat) main.scrollTop = 0; else el.scrollIntoView();
   }
 
@@ -3636,8 +3658,31 @@ histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_
     c.appendChild(d);
   });
 
-  document.getElementById('menu').onclick = function () { document.body.classList.toggle('nav-open'); };
-  main.addEventListener('click', function (e) { if (!e.target.closest('#menu')) document.body.classList.remove('nav-open'); });
+  // light / dark / system, remembered in this browser only
+  var themeBox = document.getElementById('theme'), theme = 'auto';
+  try { theme = localStorage.getItem('be-theme') || 'auto'; } catch (e) {}
+  if (theme !== 'light' && theme !== 'dark') theme = 'auto';
+  function paintTheme() {
+    if (theme === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme);
+    $$('button', themeBox).forEach(function (b) { b.setAttribute('aria-pressed', b.dataset.theme === theme ? 'true' : 'false'); });
+  }
+  themeBox.addEventListener('click', function (e) {
+    var b = e.target.closest('button');
+    if (!b) return;
+    theme = b.dataset.theme;
+    try { localStorage.setItem('be-theme', theme); } catch (e) {}
+    paintTheme();
+  });
+  paintTheme();
+
+  var menu = document.getElementById('menu');
+  function setNav(on) {
+    document.body.classList.toggle('nav-open', on);
+    menu.setAttribute('aria-expanded', on ? 'true' : 'false');
+  }
+  menu.onclick = function () { setNav(!document.body.classList.contains('nav-open')); };
+  main.addEventListener('click', function (e) { if (!e.target.closest('#menu')) setNav(false); });
   q.addEventListener('input', renderNav);
   nav.addEventListener('click', function (e) {
     var tog = e.target.closest('.tog'), link = e.target.closest('a.cat-link'), id;
