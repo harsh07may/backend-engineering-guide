@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<style>
+.wire{fill:none;stroke:#17211e;stroke-width:2;stroke-linecap:round}
+.hub{fill:#0a6b5d}
+@media (prefers-color-scheme:dark){.wire{stroke:#e2e9e6}.hub{fill:#5fcdb9}}
+</style>
+<g class="wire">
+<path d="M10.15 8.43 6.9 14.48"/>
+<path d="M13.85 8.43 17.1 14.48"/>
+<path d="M9 18h6"/>
+<circle cx="5" cy="18" r="2.6"/>
+<circle cx="19" cy="18" r="2.6"/>
+</g>
+<circle class="hub" cx="12" cy="5" r="3"/>
+</svg>

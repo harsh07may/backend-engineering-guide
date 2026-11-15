@@ -4,9 +4,10 @@
 Section files are HTML with two shorthands:
   ```lang title=optional     fenced code, escaped automatically
   `inline`                   inline code, escaped automatically
+src/favicon.svg is copied to the site root alongside it.
 Run: python3 build.py
 """
-import html, pathlib, re, sys
+import html, pathlib, re, shutil, sys
 
 root = pathlib.Path(__file__).parent
 FENCE = re.compile(r"^```(\w+)(?: title=([^\n]+))?\n(.*?)^```[ \t]*$", re.M | re.S)
@@ -42,4 +43,5 @@ if dupes or missing:
     sys.exit(f"duplicate ids: {dupes}\nbroken links: {missing}")
 
 (root / "index.html").write_text(page, encoding="utf-8")
+shutil.copyfile(root / "src" / "favicon.svg", root / "favicon.svg")
 print(f"index.html  {len(page) / 1024:.0f} KB  {page.count('class=\"topic\"')} topics")
