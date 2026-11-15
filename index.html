@@ -3571,6 +3571,141 @@ histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_
 </article>
 </section>
 
+<section class="cat" id="capstone" data-title="Capstone Project">
+<header class="cat-head">
+  <p class="eyebrow">15 · Capstone</p>
+  <h2>Capstone Project</h2>
+  <p class="sum">Fourteen chapters built the orders API one piece at a time, each piece introduced by the chapter that needed it. This one hands the same service back as a specification and asks you to build it from an empty directory, choosing the techniques yourself.</p>
+</header>
+
+<article class="topic" id="capstone-brief" data-k="capstone project brief requirements scope rules build from scratch">
+<h3>The brief</h3>
+<p class="lede">Reading a technique and reaching for it are different skills. Everything so far was prompted: the chapter named the problem before showing the answer. Nothing below names it.</p>
+<p>You are building one service, the orders API for a small shop. Customers browse a catalogue, place orders against stock, and read their own order history. Three properties have to hold while they do it: <b>stock never goes negative</b>, <b>a resubmitted order is not placed twice</b>, and <b>a dependency failing does not take the service down with it</b>.</p>
+<p>Those three are the whole exercise. Everything else is the scaffolding they need.</p>
+<h4>Rules</h4>
+<ul>
+<li>Start from an empty directory. The only part worth copying is <a href="#project-setup">Project setup</a>.</li>
+<li>Build in the milestone order below, and run the service at the end of each milestone. A milestone that has not run is not finished.</li>
+<li>Where a requirement is checkable, write the check before the code. <a href="#unit-testing">Unit Testing</a> covers the mechanics.</li>
+<li>Open a linked chapter when you are stuck, after you have tried. The links are an index, not a reading order.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>In scope</th><th>Left out, deliberately</th></tr>
+<tr><td>Products, orders, users, authentication</td><td>A user interface of any kind</td></tr>
+<tr><td>PostgreSQL, Redis, one queue, one worker</td><td>Real payment processing</td></tr>
+<tr><td>One deployable service</td><td>A second service, until the stretch goals</td></tr>
+<tr><td>Logs, metrics, traces, one alert</td><td>Kubernetes, multi-region, service mesh</td></tr>
+</table></div>
+<p>The shape is a <a href="#monolith">monolith</a>, and that is the right starting point for one developer and one database. <a href="#trade-offs">Trade-offs</a> argues the case; the stretch goals break it apart once there is something to break.</p>
+<p class="pit"><b>Common mistake</b> Writing all seven milestones before running any of them. The first time you start the service you want one new thing to be wrong, not seven.</p>
+</article>
+
+<article class="topic" id="capstone-data" data-k="capstone schema tables constraints money cents data model requirements">
+<h3>The data you must store</h3>
+<p class="lede">Four tables carry the service. The constraints matter more than the columns: each one is a rule the database keeps even on the day your code forgets to.</p>
+<div class="tbl"><table>
+<tr><th>Table</th><th>Holds</th><th>The database must enforce</th></tr>
+<tr><td>users</td><td>Email, hashed password, when they joined</td><td>One account per email</td></tr>
+<tr><td>products</td><td>Name, price, stock on hand</td><td>Price and stock never go below zero</td></tr>
+<tr><td>orders</td><td>Owner, status, total, when</td><td>Status is one of <code>pending</code>, <code>paid</code>, <code>shipped</code>, <code>cancelled</code>; the owner is a real user</td></tr>
+<tr><td>order_items</td><td>One row per product in an order</td><td>Quantity above zero; deleting an order deletes its items</td></tr>
+</table></div>
+<p>Two decisions are worth making deliberately, because both are expensive to reverse:</p>
+<ul>
+<li><b>Money is an integer count of cents.</b> Not a float. <code>0.1 + 0.2</code> is not <code>0.3</code> in binary floating point, and a cent lost per order compounds.</li>
+<li><b>An order item stores the price it was bought at.</b> Not a join to the product. A price change next week must not rewrite what a customer paid last week.</li>
+</ul>
+<p>Write the schema as SQL you can re-run, and let the constraints do the work described in <a href="#relational-design">Relational Database Design</a> and <a href="#acid">ACID Properties</a>. Two more tables arrive later: one for idempotency keys in milestone 5, and an outbox if you take the stretch goals.</p>
+<p>When milestone 2 works, run each query through <code>EXPLAIN</code>. A sequential scan is fine over ten rows and not over ten million; add the index the plan asks for rather than the one you guessed. <a href="#indexes">Indexes</a> and <a href="#query-optimization">Query Optimization</a> read the output.</p>
+<p class="pit"><b>Common mistake</b> Storing prices as <code>float</code> or <code>money</code>, or deriving an order's total by joining to the current product price. Both look correct until the catalogue changes.</p>
+</article>
+
+<article class="topic" id="capstone-api" data-k="capstone contract endpoints http api rest problem details envelope idempotency key">
+<h3>The contract you must expose</h3>
+<p class="lede">The contract is the part other people build against, so it is the part you cannot quietly change. Fix it before writing handlers.</p>
+<div class="tbl"><table>
+<tr><th>Endpoint</th><th>Does</th><th>Answers</th></tr>
+<tr><td><code>GET /health</code></td><td>Liveness. No auth, no database</td><td><code>200</code></td></tr>
+<tr><td><code>POST /v1/auth/register</code></td><td>Creates an account</td><td><code>201</code>, <code>409</code> if the email is taken</td></tr>
+<tr><td><code>POST /v1/auth/login</code></td><td>Exchanges credentials for a token</td><td><code>200</code>, <code>401</code></td></tr>
+<tr><td><code>GET /v1/products</code></td><td>Lists the catalogue, filterable by name</td><td><code>200</code> with a page</td></tr>
+<tr><td><code>GET /v1/products/:id</code></td><td>One product</td><td><code>200</code>, <code>404</code></td></tr>
+<tr><td><code>POST /v1/orders</code></td><td>Places an order against stock</td><td><code>201</code>, <code>409</code> out of stock, <code>400</code> without an idempotency key</td></tr>
+<tr><td><code>GET /v1/orders</code></td><td>The caller's own orders</td><td><code>200</code> with a page</td></tr>
+<tr><td><code>GET /v1/orders/:id</code></td><td>One of the caller's orders</td><td><code>200</code>, <code>404</code></td></tr>
+<tr><td><code>PATCH /v1/orders/:id</code></td><td>Cancels an order</td><td><code>200</code>, <code>409</code> once it has shipped</td></tr>
+</table></div>
+<p>Someone else's order id answers <code>404</code>, not <code>403</code>, so the response does not confirm the id exists. <a href="#authorization">Authorization</a> explains why that distinction is a security property and not a style choice.</p>
+<h4>Three rules across every endpoint</h4>
+<ul>
+<li>Every input is validated at the door and every failure uses one shape, the Problem Details format from <a href="#api-design">API Design</a>.</li>
+<li>Lists are paginated by cursor, never unbounded. <a href="#pagination">Pagination</a> has the query.</li>
+<li>The path carries the version. <a href="#versioning">API Versioning</a> covers what you may add later without breaking callers.</li>
+</ul>
+<div class="code"><div class="code-head"><span>the three shapes a caller sees</span></div><pre><code class="nohighlight">GET /v1/products?limit=20&amp;cursor=1022
+200  { "data": [ … ], "nextCursor": 1002 }
+
+POST /v1/orders
+Authorization: Bearer &lt;token&gt;
+Idempotency-Key: 7c3f1b9e-…
+201  { "id": 42, "status": "pending", "total_cents": 1998 }
+
+422  application/problem+json
+     { "title": "Invalid request", "status": 422,
+       "errors": { "quantity": ["Too big: expected &lt;= 99"] } }</code></pre></div>
+<p class="pit"><b>Common mistake</b> Letting the error shape drift, so one handler returns <code>{ error }</code>, another <code>{ message }</code> and a third an HTML stack trace. Callers end up parsing all three.</p>
+</article>
+
+<article class="topic" id="capstone-milestones" data-k="capstone milestones build order steps plan walking skeleton">
+<h3>Seven milestones</h3>
+<p class="lede">Build in this order. Each milestone ends in something you can run, because the next one will hide the reason it does not.</p>
+<ol class="seq">
+<li><b>Walking skeleton</b><span><code>/health</code>, configuration read from the environment, one structured log line per request. Deploy it now, while there is nothing in it. <a href="#project-setup">Project setup</a>, <a href="#env-vars">Environment Variables</a>, <a href="#logging">Logging</a></span></li>
+<li><b>The read path</b><span>Schema, a connection pool, <code>GET /v1/products</code> with cursor pagination, and the query plans to go with it. <a href="#sql">SQL</a>, <a href="#connection-pooling">Connection Pooling</a>, <a href="#pagination">Pagination</a>, <a href="#indexes">Indexes</a></span></li>
+<li><b>The write path</b><span><code>POST /v1/orders</code> inside one transaction, decrementing stock. Then prove stock cannot go negative when two customers buy the last unit at once. <a href="#transactions">Transactions</a>, <a href="#race-conditions">Race Conditions</a>, <a href="#atomic-operations">Atomic Operations</a></span></li>
+<li><b>Identity</b><span>Register and login, passwords hashed, a token checked on every request, and orders scoped to their owner. <a href="#password-hashing">Password Hashing</a>, <a href="#jwt">JWT</a>, <a href="#authorization">Authorization</a></span></li>
+<li><b>Exactly once</b><span>An <code>Idempotency-Key</code> on <code>POST /v1/orders</code>, stored with its response and replayed on a repeat. Back off and retry the calls you make outward. <a href="#idempotency">Idempotency</a>, <a href="#retries">Retries</a></span></li>
+<li><b>Work that happens later</b><span>Move the confirmation email off the request path onto a queue, with a worker, retries and somewhere for the messages that never succeed. <a href="#message-queues">Message Queues</a>, <a href="#producer-consumer">Producer-Consumer Pattern</a>, <a href="#dead-letter-queues">Dead-Letter Queues</a></span></li>
+<li><b>Ship it</b><span>A container, a pipeline that runs the tests, metrics, a trace id threaded through every log line, and one alert that would have caught milestone 3's bug. <a href="#docker">Docker</a>, <a href="#ci-cd">CI/CD</a>, <a href="#metrics">Metrics</a>, <a href="#tracing">Distributed Tracing</a>, <a href="#alerts">Alerts</a></span></li>
+</ol>
+<p>Milestones 1 and 7 bracket the rest on purpose. A service that is deployed and observable on the first day is the one you can still debug on the last, and leaving both to the end is how a working codebase becomes an unshippable one.</p>
+<p class="pit"><b>Common mistake</b> Treating milestone 3 as finished because the happy path returns <code>201</code>. It is finished when two concurrent requests for one unit of stock produce one order, and you have run that case.</p>
+</article>
+
+<article class="topic" id="capstone-done" data-k="capstone definition of done acceptance checks verify proof testing">
+<h3>Definition of done</h3>
+<p class="lede">Every requirement in this chapter has a check that passes or fails. A requirement you cannot check is an intention, not a property of your service.</p>
+<div class="tbl"><table>
+<tr><th>What must hold</th><th>How you prove it</th></tr>
+<tr><td>Stock never goes negative</td><td>Fire fifty concurrent orders for the last unit. One returns <code>201</code>, the rest <code>409</code>, and stock reads zero. <a href="#race-conditions">Race Conditions</a></td></tr>
+<tr><td>A retry places one order</td><td>Send the same <code>Idempotency-Key</code> twice. The second call returns the first order and the table gains one row. <a href="#idempotency">Idempotency</a></td></tr>
+<tr><td>Orders stay private</td><td>Request another user's order id with a valid token. <code>404</code>. <a href="#authorization">Authorization</a></td></tr>
+<tr><td>Bad input is rejected</td><td>Post a negative quantity, a string quantity and no body at all. Three <code>422</code>s in one shape. <a href="#api-design">API Design</a></td></tr>
+<tr><td>The service outlives its database</td><td>Stop PostgreSQL, send traffic, start it again. Requests fail as <code>503</code> rather than crashing the process, and recovery needs no restart. <a href="#failure-testing">Failure Testing</a>, <a href="#fault-tolerance">Fault Tolerance</a></td></tr>
+<tr><td>It holds a known load</td><td>A load test at a rate you picked, with p95 under a budget you wrote down first. <a href="#load-testing">Load Testing</a>, <a href="#latency">Latency</a></td></tr>
+<tr><td>No secret ships in the image</td><td>Search the built image for your token and find nothing. <a href="#secrets-management">Secrets Management</a>, <a href="#docker">Docker</a></td></tr>
+<tr><td>A failure is visible</td><td>Reintroduce milestone 3's bug on purpose. The alert fires, and a log line names the request that caused it. <a href="#alerts">Alerts</a>, <a href="#production-debugging">Production Debugging</a></td></tr>
+</table></div>
+<p>Write the numbers down before you measure. A latency budget chosen after seeing the result is a description of what you built, not a target it had to meet.</p>
+<p class="pit"><b>Common mistake</b> Running the load test once, on a laptop, against an empty database. Ten rows fit in memory and every query looks fast; seed the catalogue first.</p>
+</article>
+
+<article class="topic" id="capstone-stretch" data-k="capstone stretch goals extensions replica cache outbox microservices partitioning">
+<h3>If you want more</h3>
+<p class="lede">Each of these replaces a simplification you were allowed above with the thing production actually does. Take them one at a time, and keep the checks passing.</p>
+<ul>
+<li>Serve catalogue reads from a replica, then find the first place a customer can see the lag. <a href="#replication">Database Replication</a>, <a href="#data-consistency">Data Consistency</a></li>
+<li>Put a cache in front of products, then make it survive every key expiring at once. <a href="#caching">Caching</a>, <a href="#caching-strategies">Caching Strategies</a></li>
+<li>Publish order events through an outbox instead of writing to the queue inside the transaction, and watch the duplicate deliveries arrive. <a href="#distributed-transactions">Distributed Transactions</a>, <a href="#event-driven">Event-Driven Architecture</a></li>
+<li>Rate-limit per user and per IP address, and decide what a shared office network should see. <a href="#rate-limiting">Rate Limiting</a></li>
+<li>Partition orders by month, then re-run milestone 2's query plans against the partitioned table. <a href="#partitioning">Partitioning</a></li>
+<li>Split the worker into its own deployable, and pay every cost <a href="#microservices">Microservices</a> lists. If it is not worth paying, that is the most useful result in this chapter.</li>
+</ul>
+<p class="more">Go deeper: <a href="https://12factor.net/">The Twelve-Factor App</a> · <a href="https://github.com/donnemartin/system-design-primer">System Design Primer</a> · <a href="https://roadmap.sh/backend">roadmap.sh backend path</a></p>
+</article>
+</section>
+
   </div>
 </main>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -3583,7 +3718,8 @@ histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_
     ['Building APIs', [['apis', 'APIs', 2, 1], ['security', 'Security', 9, 3]]],
     ['Data', [['databases', 'Databases', 3, 1], ['storage', 'Data Storage', 4, 1]]],
     ['Scale', [['distributed', 'Distributed Systems', 7, 2], ['messaging', 'Messaging and Background Jobs', 8, 2], ['design', 'System Design', 10, 3], ['performance', 'Performance', 11, 3]]],
-    ['Shipping', [['testing', 'Testing', 12, 4], ['deployment', 'Deployment and Infrastructure', 13, 4], ['observability', 'Observability', 14, 4]]]
+    ['Shipping', [['testing', 'Testing', 12, 4], ['deployment', 'Deployment and Infrastructure', 13, 4], ['observability', 'Observability', 14, 4]]],
+    ['Capstone', [['capstone', 'Capstone Project', 15, 5]]]
   ];
   var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
   var esc = function (s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;'); };

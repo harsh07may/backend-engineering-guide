@@ -1,6 +1,6 @@
 # Backend Engineering Field Guide
 
-A single-page guide to backend engineering fundamentals, taught through Node.js, Express 5 and TypeScript. It covers 14 chapters, from how the internet works to observability.
+A single-page guide to backend engineering fundamentals, taught through Node.js, Express 5 and TypeScript. It covers 14 chapters, from how the internet works to observability, and closes with a capstone project that specifies the running example so you can rebuild it from scratch.
 
 Read it: https://harsh07may.github.io/backend-engineering-guide/
 
